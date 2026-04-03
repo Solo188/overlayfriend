@@ -96,10 +96,11 @@ public class MainActivity extends AppCompatActivity {
         });
 
         m_btnStartStop.setOnClickListener(v -> toggleService());
+
         m_btnSettings.setOnClickListener(v -> {
             startActivity(new Intent(this, com.endfield.overlayassistant.settings.SettingsActivity.class));
         });
-    }
+        
     
                 
     
