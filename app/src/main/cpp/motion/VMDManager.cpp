@@ -9,7 +9,7 @@
  *
  * Saba API notes used here:
  *  - VMDAnimation::Create(std::shared_ptr<MMDModel>)  — takes shared_ptr
- *  - VMDAnimation::LoadVMD(path, MMDModel*)            — raw pointer
+
  *  - MMDModel::UpdateAllAnimation(VMDAnimation*, float frame, float physElapsed)
  *  - GetMorphManager()->GetMorph(name)->SetWeight(w)   — for morphs
  */
@@ -18,6 +18,7 @@
 #include "renderer/MMDRenderer.h"
 
 #include <Saba/Model/MMD/VMDAnimation.h>
+#include <Saba/Model/MMD/VMDFile.h>
 #include <Saba/Model/MMD/MMDModel.h>
 
 #include <android/log.h>
@@ -72,9 +73,14 @@ bool VMDManager::loadMotion(const std::string& vmdPath, const std::string& categ
         LOGE("VMDAnimation::Create failed");
         return false;
     }
-    // LoadVMD takes a raw pointer for the model
-    if (!anim->LoadVMD(vmdPath, rawModel)) {
-        LOGE("VMDAnimation::LoadVMD failed: %s", vmdPath.c_str());
+    // Load the VMD file from disk, then add it to the animation object
+    saba::VMDFile vmdFile;
+    if (!saba::ReadVMDFile(&vmdFile, vmdPath.c_str())) {
+        LOGE("ReadVMDFile failed: %s", vmdPath.c_str());
+        return false;
+    }
+    if (!anim->Add(vmdFile)) {
+        LOGE("VMDAnimation::Add failed: %s", vmdPath.c_str());
         return false;
     }
 
