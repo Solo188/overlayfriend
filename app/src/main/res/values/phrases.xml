@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <string-array name="phrases_stranger">
+        <item>…Who are you?</item>
+        <item>Don\'t touch me without permission.</item>
+        <item>I have no reason to speak with you.</item>
+        <item>Keep your distance.</item>
+        <item>What do you want?</item>
+        <item>I\'m observing you. Don\'t do anything suspicious.</item>
+        <item>You seem… tolerable. For now.</item>
+    </string-array>
+
+    <string-array name="phrases_friend">
+        <item>Hmph. I suppose I don\'t mind you being here.</item>
+        <item>You\'re persistent. I\'ll give you that.</item>
+        <item>Fine. What do you need?</item>
+        <item>Don\'t read too much into this.</item>
+        <item>You\'ve grown on me. A little.</item>
+        <item>I\'ll allow it. Just this once.</item>
+        <item>Your presence is… not entirely unwelcome.</item>
+    </string-array>
+
+    <string-array name="phrases_partner">
+        <item>You\'re back. Good.</item>
+        <item>I was waiting for you. Not that I\'d admit it.</item>
+        <item>Don\'t make me say it again. You already know.</item>
+        <item>Stay close. I\'ll allow it.</item>
+        <item>…I missed you. Don\'t push it.</item>
+        <item>You\'re mine to protect now. Deal with it.</item>
+        <item>Hmph. You\'re smiling. Stop. It\'s distracting.</item>
+    </string-array>
+
+    <string-array name="phrases_night">
+        <item>Still awake? You should sleep.</item>
+        <item>It\'s late. Even I rest eventually.</item>
+        <item>Don\'t stay up too long. I won\'t always be here to watch over you.</item>
+        <item>The night is quiet. I prefer it.</item>
+        <item>…Are you cold? I could… never mind.</item>
+        <item>Sleep. I\'ll still be here when you wake up.</item>
+    </string-array>
+
+    <string-array name="phrases_morning">
+        <item>You\'re up early. Good discipline.</item>
+        <item>Morning already? Don\'t keep me waiting.</item>
+        <item>Start the day properly. I\'m watching.</item>
+    </string-array>
+
+    <string-array name="phrases_afternoon">
+        <item>Still at it? Don\'t tire yourself out.</item>
+        <item>Afternoon already. Time passes quickly around you.</item>
+        <item>Take a break if you need one. I won\'t judge.</item>
+    </string-array>
+
+    <string-array name="phrases_evening">
+        <item>Evening. How was your day?</item>
+        <item>It\'s getting dark. Stay alert.</item>
+        <item>Don\'t stay out too late. I\'d rather you were here.</item>
+    </string-array>
+
+</resources>

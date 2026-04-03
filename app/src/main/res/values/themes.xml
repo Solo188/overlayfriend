@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.EndfieldOverlay" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">#E8B4B8</item>
+        <item name="colorPrimaryVariant">#C49BA0</item>
+        <item name="colorOnPrimary">#1A1A2E</item>
+
+        <item name="colorSecondary">#7C7CAE</item>
+        <item name="colorSecondaryVariant">#5C5C8E</item>
+        <item name="colorOnSecondary">#FFFFFF</item>
+
+        <item name="android:colorBackground">#1A1A2E</item>
+        <item name="colorSurface">#252540</item>
+        <item name="colorOnSurface">#FFFFFF</item>
+
+        <item name="android:statusBarColor">#0F0F1F</item>
+        <item name="android:navigationBarColor">#0F0F1F</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

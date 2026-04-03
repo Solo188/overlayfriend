@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Endfield Overlay</string>
+
+    <string name="section_permissions">Permissions</string>
+    <string name="section_character">Character Model</string>
+    <string name="perm_overlay">Draw Over Other Apps</string>
+    <string name="perm_notifications">Notifications</string>
+    <string name="btn_start">Start Overlay</string>
+    <string name="btn_stop">Stop Overlay</string>
+    <string name="btn_settings">Settings</string>
+    <string name="affinity_loading">Loading affinity…</string>
+    <string name="affinity_display">Affinity: %1$d pts — %2$s</string>
+    <string name="scanning_models">Scanning model folders…</string>
+    <string name="no_models_found">No .pmx models found in /sdcard/Documents/Assistant/Models/</string>
+    <string name="selected_char">Character: %1$s</string>
+
+    <string name="settings_title">Overlay Settings</string>
+    <string name="label_scale">Model Scale (0.5× – 2.5×)</string>
+    <string name="label_opacity">Opacity</string>
+    <string name="label_silent_mode">Silent Mode (hide text bubbles)</string>
+    <string name="label_position_lock">Position Lock (disable dragging)</string>
+
+    <string name="notif_channel_name">Endfield Overlay</string>
+    <string name="notif_running">MMD overlay is active</string>
+    <string name="notif_stop">Stop</string>
+</resources>
