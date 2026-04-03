@@ -31,6 +31,7 @@
 
 // stb_image — bundled inside saba's external/stb/include/
 // STB_IMAGE_IMPLEMENTATION is defined by Saba internally; we only need the header.
+#define STB_IMAGE_IMPLEMENTATION  // <--- Добавь это
 #include <stb_image.h>
 
 #define LOG_TAG "MMDRenderer"
