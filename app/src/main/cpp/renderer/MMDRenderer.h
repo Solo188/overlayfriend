@@ -36,6 +36,7 @@ public:
 
 private:
     void buildVAO();
+    void loadTextures();
     void uploadVertices();
     void drawModel();
     void drawOutline();
