@@ -100,12 +100,8 @@ public class MainActivity extends AppCompatActivity {
         m_btnSettings.setOnClickListener(v -> {
             startActivity(new Intent(this, com.endfield.overlayassistant.settings.SettingsActivity.class));
         });
-        
-    
-                
-    
-    
-        
+    }
+
     private void toggleService() {
         if (!Settings.canDrawOverlays(this)) {
             Toast.makeText(this, "Overlay permission required", Toast.LENGTH_SHORT).show();
