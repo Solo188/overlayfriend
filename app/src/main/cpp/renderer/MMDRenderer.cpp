@@ -28,6 +28,24 @@
 #define LOG_TAG "MMDRenderer"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+MMDRenderer::MMDRenderer() : 
+    m_glReady(false), 
+    m_vao(0), 
+    m_vboPos(0), m_vboNorm(0), m_vboUV(0), m_vboIBO(0),
+    m_texturesLoaded(false) 
+{
+}
+
+MMDRenderer::~MMDRenderer() {
+    if (m_vao != 0) glDeleteVertexArrays(1, &m_vao);
+    if (m_vboPos != 0) {
+        GLuint vbos[] = {m_vboPos, m_vboNorm, m_vboUV, m_vboIBO};
+        glDeleteBuffers(4, vbos);
+    }
+    for (auto tex : m_textures) {
+        if (tex != 0) glDeleteTextures(1, &tex);
+    }
+}
 
 // ─── Shaders ─────────────────────────────────────────────────────────────────
 
