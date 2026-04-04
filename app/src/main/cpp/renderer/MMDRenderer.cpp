@@ -154,6 +154,14 @@ static unsigned char* tryLoadTexture(const std::string& path, int* w, int* h, in
     return data;
 }
 
+// ─── Constructor / Destructor ───────────────────────────────────────────────
+// These MUST be defined in the .cpp file because the class uses std::unique_ptr
+// with incomplete types (forward-declared in the header). The compiler needs to
+// know the full type at the point of destruction, which only the .cpp sees after
+// all headers are included.
+MMDRenderer::MMDRenderer()  = default;
+MMDRenderer::~MMDRenderer() { shutdown(); }
+
 // ─── Lifecycle ────────────────────────────────────────────────────────────────
 
 bool MMDRenderer::initialize(int width, int height) {
@@ -394,17 +402,16 @@ void MMDRenderer::render(float /*dt*/) {
     // function.  We only need to upload the already-updated vertex data here.
     uploadVertices();
 
-    // FIX: Camera adjusted for MMD/Saba units.
-    // Saba loads PMX models in centimeter scale: a typical character is
-    // ~160 cm tall.  The original camera (eye at Z=40) placed the camera
-    // only 40 cm away from the model origin — far too close.
-    // New values: eye at (0, 10, 20) looking at (0, 10, 0) with a 30° FOV
-    // frames the full body nicely in a 400×600 overlay window.
+    // Camera: MMD/Saba coordinate system.
+    // A typical PMX character is ~20 units tall (center of mass ~10 units up).
+    // eye at (0, 10, 40), looking at (0, 10, 0), FOV 45° frames the full body
+    // with a small margin in a 400×600 overlay window.
+    // near=0.1, far=500 covers the full Saba scene range.
     float aspect = (m_height > 0)
         ? static_cast<float>(m_width) / static_cast<float>(m_height)
         : 1.f;
-    glm::mat4 proj  = glm::perspective(glm::radians(30.f), aspect, 0.1f, 500.f);
-    glm::mat4 view  = glm::lookAt(glm::vec3(0.f, 10.f, 20.f),
+    glm::mat4 proj  = glm::perspective(glm::radians(45.f), aspect, 0.1f, 500.f);
+    glm::mat4 view  = glm::lookAt(glm::vec3(0.f, 10.f, 40.f),
                                   glm::vec3(0.f, 10.f,  0.f),
                                   glm::vec3(0.f,  1.f,  0.f));
     glm::mat4 model = glm::mat4(1.f);
