@@ -43,10 +43,13 @@ public class OverlayService extends Service {
     private String  m_charName  = "DefaultChar";
     private boolean m_nightMode = false;
 
-    private final Runnable m_tickRunnable = () -> {
-        m_affinity.onSessionTick();
-        checkNightMode();
-        m_handler.postDelayed(m_tickRunnable, TICK_INTERVAL);
+    private final Runnable m_tickRunnable = new Runnable() {
+        @Override
+        public void run() {
+            m_affinity.onSessionTick();
+            checkNightMode();
+            m_handler.postDelayed(this, TICK_INTERVAL);
+        }
     };
 
     @Override
