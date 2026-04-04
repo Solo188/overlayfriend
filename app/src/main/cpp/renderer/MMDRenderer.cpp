@@ -298,14 +298,15 @@ void MMDRenderer::render(float /*dt*/){
     uploadVertices();
 
     // Camera calibrated for Yvonne.pmx:
-    // model occupies Y=0..20 (height~20), center~(0,10,0)
-    // eye at Z=30 with FOV=30 shows ~16 units half-height → fits ~20u model
+    // Model: Y=0..20 (height~20 units), center=(0,10,0)
+    // At Z=42, FOV=28: half-height = 42*tan(14°) = 42*0.249 = 10.5u
+    // → full 21u visible with small margin, full model fits in frame
     float aspect = m_height>0
         ? static_cast<float>(m_width)/static_cast<float>(m_height) : 1.f;
-    glm::mat4 proj  = glm::perspective(glm::radians(30.f), aspect, 0.1f, 500.f);
-    glm::mat4 view  = glm::lookAt(glm::vec3(0,10,30),
-                                  glm::vec3(0,10, 0),
-                                  glm::vec3(0, 1, 0));
+    glm::mat4 proj  = glm::perspective(glm::radians(28.f), aspect, 0.1f, 500.f);
+    glm::mat4 view  = glm::lookAt(glm::vec3(0, 10, 42),
+                                  glm::vec3(0, 10,  0),
+                                  glm::vec3(0,  1,  0));
     glm::mat4 model = glm::mat4(1.f);
     glm::mat4 mvp   = proj * view * model;
 
