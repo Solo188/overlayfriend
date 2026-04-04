@@ -25,8 +25,7 @@ public class OverlayView extends FrameLayout {
     private TextView      m_bubble;
     private final Handler m_uiHandler = new Handler(Looper.getMainLooper());
 
-    private volatile boolean m_glReady   = false;
-    // Path queued before GL context was ready — loaded on first onSurfaceCreated
+    private volatile boolean m_glReady        = false;
     private volatile String  m_pendingPmxPath = null;
 
     private float m_touchStartRawX, m_touchStartRawY;
@@ -56,27 +55,26 @@ public class OverlayView extends FrameLayout {
         m_glView = new GLSurfaceView(context);
         m_glView.setEGLContextClientVersion(3);
 
-        // ════════════════════════════════════════════════════════════════════
-        // CRITICAL FIX: Make GLSurfaceView transparent so the model renders
-        // over other apps instead of showing a black opaque rectangle.
-        //
-        // Without these two lines the SurfaceFlinger compositor treats the
-        // GL surface as fully opaque and the black background hides everything.
-        // ════════════════════════════════════════════════════════════════════
         m_glView.setZOrderOnTop(true);
         m_glView.getHolder().setFormat(PixelFormat.TRANSLUCENT);
 
-        // EGL config: RGBA_8888 + 16-bit depth, 0 stencil
         m_glView.setEGLConfigChooser(8, 8, 8, 8, 16, 0);
 
         m_glView.setRenderer(new GLSurfaceView.Renderer() {
             @Override
             public void onSurfaceCreated(GL10 gl, EGLConfig config) {
+                // FIX: Reset m_glReady on every surface (re)creation.
+                // The GL context was destroyed — any previously loaded GPU
+                // resources (VAO, VBOs, textures) are now invalid.
                 m_glReady = false;
+
+                // FIX: Pass the real fixed dimensions; nativeInit builds shaders
+                // and sets up OpenGL state — it must always run FIRST.
                 boolean ok = m_renderer.nativeInit(GL_W, GL_H);
                 if (ok) {
                     m_glReady = true;
-                    // Load model that was queued before GL was ready
+                    // Load the model AFTER a successful nativeInit so that
+                    // buildVAO() and loadTextures() have a valid GL context.
                     String pending = m_pendingPmxPath;
                     if (pending != null) {
                         m_pendingPmxPath = null;
@@ -87,31 +85,25 @@ public class OverlayView extends FrameLayout {
 
             @Override
             public void onSurfaceChanged(GL10 gl, int width, int height) {
+                // FIX: Only call nativeSurfaceChanged (viewport resize); do NOT
+                // call nativeInit here.  Calling nativeInit on every resize
+                // re-creates shaders but never reloads the model, leaving the
+                // renderer in a half-initialised state.  The original code also
+                // incorrectly set m_glReady = true before the pending model was
+                // loaded, causing nativeLoadModel to race with onSurfaceCreated.
                 m_renderer.nativeSurfaceChanged(width, height);
-                if (!m_glReady && width > 0 && height > 0) {
-                    boolean ok = m_renderer.nativeInit(width, height);
-                    if (ok) {
-                        m_glReady = true;
-                        String pending = m_pendingPmxPath;
-                        if (pending != null) {
-                            m_pendingPmxPath = null;
-                            m_renderer.nativeLoadModel(pending);
-                        }
-                    }
-                }
             }
 
             @Override
             public void onDrawFrame(GL10 gl) {
-                if (!m_glReady) return;
                 m_renderer.nativeRender();
             }
         });
 
         m_glView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
+
         addView(m_glView, new FrameLayout.LayoutParams(GL_W, GL_H));
 
-        // Speech bubble
         m_bubble = new TextView(context);
         m_bubble.setTextSize(14f);
         m_bubble.setTextColor(0xFFFFFFFF);
@@ -128,11 +120,12 @@ public class OverlayView extends FrameLayout {
     // ── Public API ────────────────────────────────────────────────────────
 
     public void loadModel(String pmxPath) {
+        // FIX: Always store the path first.  If the GL context is already
+        // ready, queue the load on the GL thread AFTER clearing the pending
+        // slot to prevent a double-load on the next surface creation.
         if (m_glReady) {
-            // GL context ready — load immediately on GL thread
             m_glView.queueEvent(() -> m_renderer.nativeLoadModel(pmxPath));
         } else {
-            // GL context not ready yet — store path, load in onSurfaceCreated
             m_pendingPmxPath = pmxPath;
         }
     }
