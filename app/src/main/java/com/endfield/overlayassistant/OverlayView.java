@@ -1,7 +1,6 @@
 package com.endfield.overlayassistant;
 
 import android.content.Context;
-import android.content.SharedPreferences;
 import android.opengl.GLSurfaceView;
 import android.os.Handler;
 import android.os.Looper;
@@ -25,7 +24,7 @@ public class OverlayView extends FrameLayout {
     private       TextView                   m_bubble;
     private final Handler                    m_uiHandler = new Handler(Looper.getMainLooper());
 
-    // FIX: track whether nativeInit has completed so nativeRender never runs before it
+    // Guards against nativeRender() being called before nativeInit() completes
     private volatile boolean m_glReady = false;
 
     private float m_touchStartRawX;
@@ -38,7 +37,7 @@ public class OverlayView extends FrameLayout {
 
     private static final int HEADPAT_SLOP_PX = 20;
 
-    // Fixed GL surface size — must match the size passed to nativeInit
+    // Fixed render surface size — large enough for a nice overlay
     private static final int GL_W = 400;
     private static final int GL_H = 600;
 
@@ -52,19 +51,20 @@ public class OverlayView extends FrameLayout {
         m_affinity = affinity;
         m_ai       = ai;
         m_params   = params;
-        inflate(context);
+        buildLayout(context);
     }
 
-    private void inflate(Context context) {
+    private void buildLayout(Context context) {
+        // ── GLSurfaceView ──────────────────────────────────────────────────
         m_glView = new GLSurfaceView(context);
         m_glView.setEGLContextClientVersion(3);
+        // Request RGBA_8888 + 16-bit depth — sufficient for MMD toon rendering
         m_glView.setEGLConfigChooser(8, 8, 8, 8, 16, 0);
         m_glView.setRenderer(new GLSurfaceView.Renderer() {
             @Override
             public void onSurfaceCreated(GL10 gl, EGLConfig config) {
-                // FIX: use fixed GL_W/GL_H instead of getWidth()/getHeight() which
-                // return 0 at this point (view not measured yet). onSurfaceChanged
-                // will follow immediately with the real dimensions and correct them.
+                // Called on GL thread. Width/height not yet known — use fixed constants.
+                // onSurfaceChanged follows immediately with real dimensions.
                 m_glReady = false;
                 boolean ok = m_renderer.nativeInit(GL_W, GL_H);
                 if (ok) m_glReady = true;
@@ -72,10 +72,9 @@ public class OverlayView extends FrameLayout {
 
             @Override
             public void onSurfaceChanged(GL10 gl, int width, int height) {
-                // This is called with real dimensions right after onSurfaceCreated.
-                // Always update the viewport so the renderer knows the actual size.
+                // Called on GL thread with real surface dimensions.
                 m_renderer.nativeSurfaceChanged(width, height);
-                // If init somehow failed (e.g. 0x0 fallback), retry it here.
+                // Safety: if nativeInit failed earlier, retry now that we have real dims
                 if (!m_glReady && width > 0 && height > 0) {
                     boolean ok = m_renderer.nativeInit(width, height);
                     if (ok) m_glReady = true;
@@ -84,14 +83,19 @@ public class OverlayView extends FrameLayout {
 
             @Override
             public void onDrawFrame(GL10 gl) {
-                // FIX: guard against rendering before init completes
+                // Skip frames until GL is fully initialised
                 if (!m_glReady) return;
                 m_renderer.nativeRender();
             }
         });
+        // RENDERMODE_WHEN_DIRTY = only draw when we request it.
+        // This stops burning CPU/GPU at 60 fps when the model is static.
+        // We'll call requestRender() from the animation tick.
+        // For now keep CONTINUOUSLY so blink/idle morphs animate smoothly.
         m_glView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
         addView(m_glView, new FrameLayout.LayoutParams(GL_W, GL_H));
 
+        // ── Speech bubble ─────────────────────────────────────────────────
         m_bubble = new TextView(context);
         m_bubble.setTextSize(14f);
         m_bubble.setTextColor(0xFFFFFFFF);
@@ -105,13 +109,20 @@ public class OverlayView extends FrameLayout {
         addView(m_bubble, lp);
     }
 
+    // ── Public API ────────────────────────────────────────────────────────
+
+    /**
+     * Load a PMX model. Must run on the GL thread because it calls OpenGL
+     * (glGenTextures etc.). Queued automatically via queueEvent.
+     */
     public void loadModel(String pmxPath) {
-        // FIX: queue on GL thread — model loading must happen on the GL thread
-        // because it uploads textures via OpenGL calls (glGenTextures etc.)
         m_glView.queueEvent(() -> m_renderer.nativeLoadModel(pmxPath));
     }
 
-    /** Queue any runnable on the GL thread (for motion loading, playback commands etc.) */
+    /**
+     * Queue any runnable on the GL thread.
+     * Use this for nativeLoadMotion, nativePlayMotionCategory, etc.
+     */
     public void queueGLEvent(Runnable r) {
         m_glView.queueEvent(r);
     }
@@ -122,28 +133,30 @@ public class OverlayView extends FrameLayout {
             m_bubble.setText(text);
             m_bubble.setVisibility(View.VISIBLE);
         });
-        m_uiHandler.postDelayed(() ->
-            m_bubble.setVisibility(View.GONE), 4000L);
+        m_uiHandler.postDelayed(() -> m_bubble.setVisibility(View.GONE), 4000L);
     }
 
     public void setSilentMode(boolean silent) {
         m_silentMode = silent;
-        if (silent) m_bubble.setVisibility(View.GONE);
+        if (silent) m_uiHandler.post(() -> m_bubble.setVisibility(View.GONE));
     }
 
     public void setPositionLocked(boolean locked) {
         m_positionLocked = locked;
     }
 
+    // ── Touch handling ────────────────────────────────────────────────────
+
     @Override
     public boolean onTouchEvent(MotionEvent event) {
         float rawX = event.getRawX();
         float rawY = event.getRawY();
 
-        // Only send touch to native if GL is ready
         if (m_glReady) {
-            m_glView.queueEvent(() ->
-                m_renderer.nativeTouchEvent(event.getX(), event.getY(), event.getAction()));
+            final float lx = event.getX();
+            final float ly = event.getY();
+            final int   action = event.getAction();
+            m_glView.queueEvent(() -> m_renderer.nativeTouchEvent(lx, ly, action));
         }
 
         switch (event.getAction()) {
@@ -167,9 +180,9 @@ public class OverlayView extends FrameLayout {
             case MotionEvent.ACTION_UP:
                 float dx = rawX - m_touchStartRawX;
                 float dy = rawY - m_touchStartRawY;
-                boolean isHeadpat = (Math.abs(dx) < HEADPAT_SLOP_PX &&
-                                     Math.abs(dy) < HEADPAT_SLOP_PX);
-                if (isHeadpat) onHeadpat();
+                if (Math.abs(dx) < HEADPAT_SLOP_PX && Math.abs(dy) < HEADPAT_SLOP_PX) {
+                    onHeadpat();
+                }
                 savePosition(m_params.x, m_params.y);
                 return true;
         }
@@ -178,17 +191,23 @@ public class OverlayView extends FrameLayout {
 
     private void onHeadpat() {
         m_affinity.onHeadpat();
-        m_renderer.nativePlayMotionCategory("touch");
+        if (m_glReady) m_glView.queueEvent(() ->
+            m_renderer.nativePlayMotionCategory("touch"));
         String response = m_ai.processInput("headpat", m_affinity.getTier());
         showBubble(response);
     }
 
     private void savePosition(int x, int y) {
         getContext().getSharedPreferences("overlay_state", Context.MODE_PRIVATE)
-                    .edit()
-                    .putInt("pos_x", x)
-                    .putInt("pos_y", y)
-                    .apply();
+                    .edit().putInt("pos_x", x).putInt("pos_y", y).apply();
+    }
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────
+
+    @Override
+    protected void onAttachedToWindow() {
+        super.onAttachedToWindow();
+        m_glView.onResume();
     }
 
     @Override
@@ -197,11 +216,5 @@ public class OverlayView extends FrameLayout {
         m_glView.queueEvent(m_renderer::nativeDestroy);
         m_glView.onPause();
         super.onDetachedFromWindow();
-    }
-
-    @Override
-    protected void onAttachedToWindow() {
-        super.onAttachedToWindow();
-        m_glView.onResume();
     }
 }
