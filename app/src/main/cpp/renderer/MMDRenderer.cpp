@@ -318,14 +318,63 @@ void MMDRenderer::buildVAO() {
     glBindVertexArray(0);
 }
 
+// Normalize a texture path for Android:
+//  - Replace Windows backslashes with forward slashes
+//  - PMX files from Windows tools often embed paths like "textures\body.png"
+static std::string normalizePath(const std::string& p) {
+    std::string r = p;
+    std::replace(r.begin(), r.end(), '\\', '/');
+    return r;
+}
+
+// Try to load a texture, attempting alternative extensions if the original fails.
+// Many PMX packs ship .tga textures renamed to .bmp, or vice-versa.
+// stb_image auto-detects format from content, so just try common extensions.
+static unsigned char* tryLoadTexture(const std::string& path, int* w, int* h, int* comp) {
+    // First: exact path as given
+    unsigned char* data = stbi_load(path.c_str(), w, h, comp, 4);
+    if (data) return data;
+
+    // Try swapping extension: png ↔ tga ↔ bmp ↔ jpg
+    static const char* exts[] = {".png", ".PNG", ".tga", ".TGA",
+                                  ".bmp", ".BMP", ".jpg", ".JPG", nullptr};
+    size_t dot = path.rfind('.');
+    if (dot == std::string::npos) return nullptr;
+    std::string base = path.substr(0, dot);
+    for (int i = 0; exts[i]; ++i) {
+        std::string alt = base + exts[i];
+        if (alt == path) continue;
+        data = stbi_load(alt.c_str(), w, h, comp, 4);
+        if (data) {
+            LOGI("Texture fallback: %s -> %s", path.c_str(), alt.c_str());
+            return data;
+        }
+    }
+    return nullptr;
+}
+
 void MMDRenderer::loadTextures() {
     if (!m_model) return;
     size_t matCount = m_model->GetMaterialCount();
     m_textures.assign(matCount, 0);
 
+    int loaded = 0, failed = 0;
     for (size_t i = 0; i < matCount; ++i) {
         const auto& mat = m_model->GetMaterials()[i];
         if (mat.m_texture.empty()) continue;
+
+        // Normalize: replace backslashes (Windows PMX tools use them)
+        std::string texPath = normalizePath(mat.m_texture);
+        LOGI("Texture[%zu]: %s", i, texPath.c_str());
+
+        int w = 0, h = 0, comp = 0;
+        unsigned char* data = tryLoadTexture(texPath, &w, &h, &comp);
+        if (!data) {
+            LOGE("Texture FAILED[%zu]: %s  reason: %s",
+                 i, texPath.c_str(), stbi_failure_reason());
+            failed++;
+            continue;
+        }
 
         glGenTextures(1, &m_textures[i]);
         glBindTexture(GL_TEXTURE_2D, m_textures[i]);
@@ -333,20 +382,13 @@ void MMDRenderer::loadTextures() {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-        int w = 0, h = 0, comp = 0;
-        unsigned char* data = stbi_load(mat.m_texture.c_str(), &w, &h, &comp, 4);
-        if (data) {
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
-                         GL_RGBA, GL_UNSIGNED_BYTE, data);
-            glGenerateMipmap(GL_TEXTURE_2D);
-            stbi_image_free(data);
-        } else {
-            LOGE("stbi_load failed: %s", mat.m_texture.c_str());
-            glDeleteTextures(1, &m_textures[i]);
-            m_textures[i] = 0;
-        }
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, data);
+        glGenerateMipmap(GL_TEXTURE_2D);
+        stbi_image_free(data);
+        loaded++;
     }
+    LOGI("Textures: %d loaded, %d failed out of %zu materials", loaded, failed, matCount);
 }
 
 // ─── Per-frame vertex upload ──────────────────────────────────────────────────
