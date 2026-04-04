@@ -81,18 +81,14 @@ const vec3 LIGHT_DIR = normalize(vec3(0.5, 1.0, 0.8));
 const vec3 LIGHT_COL = vec3(1.0, 0.98, 0.95);
 
 void main() {
-    // Start with material diffuse; alpha comes from m_alpha (separate field in Saba)
     vec4 baseColor = u_diffuse;
 
     if (u_hasTexture == 1) {
         vec4 texColor = texture(u_texDiffuse, v_uv);
         baseColor.rgb *= texColor.rgb;
-        // Only multiply alpha if texture has meaningful alpha
         baseColor.a   *= texColor.a;
     }
 
-    // FIX: raise discard threshold — some MMD materials have alpha near 0 by design
-    // but are still meant to be visible. Use 0.01 instead of 0.05.
     if (baseColor.a * u_globalAlpha < 0.01) discard;
 
     vec3  N     = normalize(v_normal);
@@ -132,10 +128,13 @@ void main() {
 )GLSL";
 
 static const char* OUTLINE_FRAG = R"GLSL(#version 300 es
-precision mediump float;
+precision highp float;
+
 out vec4 fragColor;
+
 uniform vec4  u_outlineColor;
 uniform float u_globalAlpha;
+
 void main() {
     fragColor = vec4(u_outlineColor.rgb, u_outlineColor.a * u_globalAlpha);
 }
@@ -144,39 +143,18 @@ void main() {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 static std::string normalizePath(const std::string& p) {
-    std::string r = p;
-    std::replace(r.begin(), r.end(), '\\', '/');
-    return r;
+    std::string out = p;
+    for (char& c : out) if (c == '\\') c = '/';
+    return out;
 }
 
 static unsigned char* tryLoadTexture(const std::string& path, int* w, int* h, int* comp) {
-    unsigned char* data = stbi_load(path.c_str(), w, h, comp, 4);
-    if (data) return data;
-
-    // Try alternative extensions — PMX packs often mislabel formats
-    static const char* exts[] = {
-        ".png", ".PNG", ".tga", ".TGA",
-        ".bmp", ".BMP", ".jpg", ".JPG", nullptr
-    };
-    size_t dot = path.rfind('.');
-    if (dot == std::string::npos) return nullptr;
-    std::string base = path.substr(0, dot);
-    for (int i = 0; exts[i]; ++i) {
-        std::string alt = base + exts[i];
-        if (alt == path) continue;
-        data = stbi_load(alt.c_str(), w, h, comp, 4);
-        if (data) {
-            LOGI("Texture fallback OK: %s", alt.c_str());
-            return data;
-        }
-    }
-    return nullptr;
+    stbi_set_flip_vertically_on_load(0);
+    unsigned char* data = stbi_load(path.c_str(), w, h, comp, STBI_rgb_alpha);
+    return data;
 }
 
 // ─── Lifecycle ────────────────────────────────────────────────────────────────
-
-MMDRenderer::MMDRenderer()  = default;
-MMDRenderer::~MMDRenderer() { shutdown(); }
 
 bool MMDRenderer::initialize(int width, int height) {
     m_width  = width;
@@ -192,10 +170,10 @@ bool MMDRenderer::initialize(int width, int height) {
         LOGE("Outline shader failed"); return false;
     }
 
+    glViewport(0, 0, width, height);
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    // CRITICAL: clear to transparent black so the overlay composites correctly
     glClearColor(0.f, 0.f, 0.f, 0.f);
 
     LOGI("initialize OK (%dx%d)", width, height);
@@ -246,7 +224,8 @@ bool MMDRenderer::loadPMXModel(const std::string& pmxPath) {
     loadTextures();
 
     m_modelLoaded = true;
-    LOGI("PMX OK: verts=%zu mats=%zu subMeshes=%zu",
+    LOGI("PMX loaded: %s  verts=%zu  mats=%zu  subMeshes=%zu",
+         pmxPath.c_str(),
          m_model->GetVertexCount(),
          m_model->GetMaterialCount(),
          m_model->GetSubMeshCount());
@@ -265,15 +244,18 @@ void MMDRenderer::buildVAO() {
     glGenVertexArrays(1, &m_vao);
     glBindVertexArray(m_vao);
 
-    // Positions (dynamic)
+    // Positions (dynamic — updated every frame via uploadVertices)
     glGenBuffers(1, &m_vboPos);
     glBindBuffer(GL_ARRAY_BUFFER, m_vboPos);
+    // Use GetPositions() (bind-pose) for the initial buffer allocation.
+    // GetUpdatePositions() is only valid after the first UpdateAllAnimation call.
+    // uploadVertices() overwrites this data with GetUpdatePositions() each frame.
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vCount * sizeof(glm::vec3)),
                  m_model->GetPositions(), GL_DYNAMIC_DRAW);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), nullptr);
 
-    // Normals (dynamic)
+    // Normals (dynamic — updated every frame via uploadVertices)
     glGenBuffers(1, &m_vboNorm);
     glBindBuffer(GL_ARRAY_BUFFER, m_vboNorm);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vCount * sizeof(glm::vec3)),
@@ -309,6 +291,8 @@ void MMDRenderer::buildVAO() {
                      expanded.data(), GL_STATIC_DRAW);
     }
     glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 }
 
 // ─── Textures ─────────────────────────────────────────────────────────────────
@@ -324,12 +308,12 @@ void MMDRenderer::loadTextures() {
         if (mat.m_texture.empty()) { skipped++; continue; }
 
         std::string path = normalizePath(mat.m_texture);
-        LOGI("Tex[%zu]: %s", i, path.c_str());
+        LOGI("Texture[%zu]: %s", i, path.c_str());
 
         int w = 0, h = 0, comp = 0;
         unsigned char* data = tryLoadTexture(path, &w, &h, &comp);
         if (!data) {
-            LOGE("Tex FAILED[%zu]: %s — %s", i, path.c_str(), stbi_failure_reason());
+            LOGE("Tex FAILED[%zu]: %s", i, path.c_str());
             failed++;
             continue;
         }
@@ -345,21 +329,35 @@ void MMDRenderer::loadTextures() {
         stbi_image_free(data);
         loaded++;
     }
-    LOGI("Textures: %d loaded / %d failed / %d no-texture, total mats=%zu",
-         loaded, failed, skipped, matCount);
+    LOGI("Textures: %d loaded, %d failed out of %zu materials", loaded, failed, matCount);
+    glBindTexture(GL_TEXTURE_2D, 0);
 }
 
 // ─── Per-frame upload ─────────────────────────────────────────────────────────
 
 void MMDRenderer::uploadVertices() {
-    if (!m_model) return;
+    if (!m_model || !m_vboPos || !m_vboNorm) return;
+
+    const glm::vec3* updPos  = m_model->GetUpdatePositions();
+    const glm::vec3* updNorm = m_model->GetUpdateNormals();
+
+    // Guard: GetUpdate* return nullptr if UpdateAllAnimation has never been
+    // called.  Skip the GPU upload in that case — the bind-pose data
+    // uploaded in buildVAO() will be used until the first animation frame.
+    if (!updPos || !updNorm) return;
+
     size_t n = m_model->GetVertexCount();
+
+    // FIX: Bind VBO explicitly before glBufferSubData.  The VAO stores
+    // attribute format pointers but NOT which ARRAY_BUFFER is currently
+    // bound — glBufferSubData operates on the bound ARRAY_BUFFER, not the VAO.
     glBindBuffer(GL_ARRAY_BUFFER, m_vboPos);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(n * sizeof(glm::vec3)),
-                    m_model->GetUpdatePositions());
+    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(n * sizeof(glm::vec3)), updPos);
+
     glBindBuffer(GL_ARRAY_BUFFER, m_vboNorm);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(n * sizeof(glm::vec3)),
-                    m_model->GetUpdateNormals());
+    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(n * sizeof(glm::vec3)), updNorm);
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
 // ─── Surface / transform ──────────────────────────────────────────────────────
@@ -367,10 +365,11 @@ void MMDRenderer::uploadVertices() {
 void MMDRenderer::onSurfaceChanged(int w, int h) {
     m_width = w; m_height = h;
     glViewport(0, 0, w, h);
+    LOGI("onSurfaceChanged %dx%d", w, h);
 }
 
 void MMDRenderer::onTouchDown(float x, float y) {
-    LOGI("touch (%.1f, %.1f)", x, y);
+    LOGI("onTouchDown (%.1f, %.1f)", x, y);
 }
 
 void MMDRenderer::setTransform(float x, float y, float scale, float alpha) {
@@ -387,19 +386,27 @@ void MMDRenderer::setMorphWeight(const std::string& name, float w) {
 // ─── Render ───────────────────────────────────────────────────────────────────
 
 void MMDRenderer::render(float /*dt*/) {
-    // CRITICAL: clear both color AND depth; alpha=0 so surface is transparent
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     if (!m_modelLoaded || !m_model) return;
 
+    // NOTE: Animation update (BeginAnimation/UpdateAllAnimation/etc.) is driven
+    // by VMDManager::update() which is called from nativeRender() before this
+    // function.  We only need to upload the already-updated vertex data here.
     uploadVertices();
 
+    // FIX: Camera adjusted for MMD/Saba units.
+    // Saba loads PMX models in centimeter scale: a typical character is
+    // ~160 cm tall.  The original camera (eye at Z=40) placed the camera
+    // only 40 cm away from the model origin — far too close.
+    // New values: eye at (0, 10, 20) looking at (0, 10, 0) with a 30° FOV
+    // frames the full body nicely in a 400×600 overlay window.
     float aspect = (m_height > 0)
         ? static_cast<float>(m_width) / static_cast<float>(m_height)
         : 1.f;
-    glm::mat4 proj  = glm::perspective(glm::radians(30.f), aspect, 0.1f, 200.f);
-    glm::mat4 view  = glm::lookAt(glm::vec3(0, 10, 40),
-                                  glm::vec3(0, 10,  0),
-                                  glm::vec3(0,  1,  0));
+    glm::mat4 proj  = glm::perspective(glm::radians(30.f), aspect, 0.1f, 500.f);
+    glm::mat4 view  = glm::lookAt(glm::vec3(0.f, 10.f, 20.f),
+                                  glm::vec3(0.f, 10.f,  0.f),
+                                  glm::vec3(0.f,  1.f,  0.f));
     glm::mat4 model = glm::mat4(1.f);
     glm::mat4 mvp   = proj * view * model;
 
@@ -442,7 +449,6 @@ void MMDRenderer::drawModel() {
         const saba::MMDSubMesh&  sm  = sms[i];
         const saba::MMDMaterial& mat = mats[sm.m_materialID];
 
-        // m_diffuse is vec3, m_alpha is separate
         m_toonShader->setUniform4f("u_diffuse",
             mat.m_diffuse.r, mat.m_diffuse.g, mat.m_diffuse.b, mat.m_alpha);
         m_toonShader->setUniform3f("u_specular",
