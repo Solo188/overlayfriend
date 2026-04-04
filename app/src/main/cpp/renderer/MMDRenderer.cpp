@@ -53,21 +53,49 @@ precision highp float;
 in vec3 v_norm; in vec2 v_uv; in vec3 v_world;
 out vec4 fragColor;
 uniform sampler2D u_tex; uniform int u_hasTex;
-uniform vec4 u_diff; uniform vec3 u_spec; uniform vec3 u_amb;
+uniform vec4 u_diff;        // rgb=diffuse color, a=material alpha
+uniform vec3 u_spec;
+uniform float u_specPow;
+uniform vec3 u_amb;
 uniform float u_alpha;
-const vec3 L = normalize(vec3(0.5,1.0,0.8));
+
+const vec3 LIGHT_DIR = normalize(vec3(0.5, 1.0, 0.7));
+const vec3 LIGHT_COL = vec3(1.0, 0.98, 0.95);
+// Ambient light color — simulates MMD's default ambient setting
+const vec3 AMB_LIGHT  = vec3(0.6, 0.6, 0.6);
+
 void main(){
-    vec4 base = u_diff;
-    if(u_hasTex==1){ vec4 t=texture(u_tex,v_uv); base.rgb*=t.rgb; base.a*=t.a; }
-    if(base.a * u_alpha < 0.01) discard;
-    vec3 N=normalize(v_norm);
-    float d=max(dot(N,L),0.0);
-    float toon = d>0.75?1.0:d>0.35?0.65:0.35;
-    vec3 amb = u_amb*0.5;
-    vec3 dif = base.rgb*vec3(1.0,0.98,0.95)*toon;
-    vec3 h=normalize(L+normalize(-v_world));
-    vec3 spc=u_spec*pow(max(dot(N,h),0.0),32.0)*0.4*toon;
-    fragColor = vec4(amb+dif+spc, base.a*u_alpha);
+    // Base color from texture if present
+    vec4 texColor = vec4(1.0);
+    if(u_hasTex == 1) texColor = texture(u_tex, v_uv);
+
+    // MMD standard lighting model:
+    //   diffuse_contribution  = material_diffuse * texture * lightDiffuse * NdotL_toon
+    //   ambient_contribution  = material_ambient * texture * lightAmbient
+    //   total = diffuse + ambient (no double-add)
+    vec3 N = normalize(v_norm);
+    float NdotL = max(dot(N, LIGHT_DIR), 0.0);
+
+    // Soft toon step — gentler than before, closer to MMD default
+    float toon = NdotL > 0.6 ? 1.0 : mix(0.5, 1.0, NdotL / 0.6);
+
+    // Diffuse: material_diffuse * texture_rgb * light_color * toon
+    vec3 diffuse = u_diff.rgb * texColor.rgb * LIGHT_COL * toon;
+
+    // Ambient: material_ambient * texture_rgb * ambient_light
+    vec3 ambient = u_amb * texColor.rgb * AMB_LIGHT;
+
+    // Specular (optional, keep subtle)
+    vec3 viewDir = normalize(-v_world);
+    vec3 halfDir = normalize(LIGHT_DIR + viewDir);
+    float s = pow(max(dot(N, halfDir), 0.0), max(u_specPow, 1.0));
+    vec3 specular = u_spec * s * 0.3 * toon;
+
+    // Final alpha: material alpha * texture alpha * global alpha
+    float finalA = u_diff.a * texColor.a * u_alpha;
+    if(finalA < 0.01) discard;
+
+    fragColor = vec4(diffuse + ambient + specular, finalA);
 }
 )GLSL";
 
@@ -310,7 +338,7 @@ void MMDRenderer::render(float /*dt*/){
     glm::mat4 model = glm::mat4(1.f);
     glm::mat4 mvp   = proj * view * model;
 
-    // Outline
+    // Outline — always cull back (we expand normals outward)
     glCullFace(GL_FRONT); glEnable(GL_CULL_FACE);
     m_outlineShader->use();
     m_outlineShader->setUniformMat4("u_mvp",   glm::value_ptr(mvp));
@@ -321,8 +349,7 @@ void MMDRenderer::render(float /*dt*/){
     m_outlineShader->setUniform1f  ("u_alpha",  m_alpha);
     drawOutline();
 
-    // Toon
-    glCullFace(GL_BACK);
+    // Toon — face culling handled per-material (m_bothFace)
     m_toonShader->use();
     m_toonShader->setUniformMat4("u_mvp",   glm::value_ptr(mvp));
     m_toonShader->setUniformMat4("u_model", glm::value_ptr(model));
@@ -330,7 +357,7 @@ void MMDRenderer::render(float /*dt*/){
     m_toonShader->setUniform1f  ("u_scale",  m_scale);
     m_toonShader->setUniform1f  ("u_alpha",  m_alpha);
     drawModel();
-    glDisable(GL_CULL_FACE);
+    glDisable(GL_CULL_FACE);  // reset after all materials
 }
 
 void MMDRenderer::drawModel(){
@@ -343,11 +370,21 @@ void MMDRenderer::drawModel(){
         const saba::MMDSubMesh&  sm  = sms[i];
         const saba::MMDMaterial& mat = mats[sm.m_materialID];
         m_toonShader->setUniform4f("u_diff",
-            mat.m_diffuse.r,mat.m_diffuse.g,mat.m_diffuse.b,mat.m_alpha);
+            mat.m_diffuse.r, mat.m_diffuse.g, mat.m_diffuse.b, mat.m_alpha);
         m_toonShader->setUniform3f("u_spec",
-            mat.m_specular.r,mat.m_specular.g,mat.m_specular.b);
+            mat.m_specular.r, mat.m_specular.g, mat.m_specular.b);
+        m_toonShader->setUniform1f("u_specPow", mat.m_specularPower);
         m_toonShader->setUniform3f("u_amb",
-            mat.m_ambient.r,mat.m_ambient.g,mat.m_ambient.b);
+            mat.m_ambient.r, mat.m_ambient.g, mat.m_ambient.b);
+
+        // Per-material face culling: bothFace=true means hair/cloth visible from both sides
+        if (mat.m_bothFace) {
+            glDisable(GL_CULL_FACE);
+        } else {
+            glEnable(GL_CULL_FACE);
+            glCullFace(GL_BACK);
+        }
+
         size_t mi = (size_t)sm.m_materialID;
         GLuint tid = mi<m_textures.size() ? m_textures[mi] : 0;
         m_toonShader->setUniform1i("u_hasTex", tid?1:0);
