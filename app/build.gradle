@@ -21,12 +21,14 @@ android {
                 arguments "-DANDROID_STL=c++_shared",
                           "-DANDROID_ARM_NEON=TRUE",
                           "-DCMAKE_BUILD_TYPE=Release"
-                abiFilters "arm64-v8a", "armeabi-v7a"
+                // Only arm64-v8a — the device is arm64 and armeabi-v7a
+                // adds build time + can cause library resolution conflicts
+                abiFilters "arm64-v8a"
             }
         }
 
         ndk {
-            abiFilters "arm64-v8a", "armeabi-v7a"
+            abiFilters "arm64-v8a"
         }
     }
 
@@ -38,8 +40,9 @@ android {
             minifyEnabled false
         }
         release {
-            minifyEnabled false
-            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            minifyEnabled true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'),
+                          'proguard-rules.pro'
         }
     }
 
@@ -61,7 +64,18 @@ android {
 
     packagingOptions {
         pickFirst 'lib/arm64-v8a/libc++_shared.so'
-        pickFirst 'lib/armeabi-v7a/libc++_shared.so'
+    }
+}
+
+// Force all androidx.lifecycle artifacts to the same version to prevent
+// the NoClassDefFoundError on ProcessLifecycleOwner$initializationListener$1
+// caused by transitive version conflicts between appcompat and lifecycle-service.
+configurations.all {
+    resolutionStrategy.eachDependency { DependencyResolveDetails details ->
+        if (details.requested.group == 'androidx.lifecycle') {
+            details.useVersion '2.6.2'
+            details.because 'Pin all lifecycle artifacts to a single version to avoid class conflicts'
+        }
     }
 }
 
@@ -71,5 +85,12 @@ dependencies {
     implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
     implementation 'androidx.preference:preference:1.2.1'
     implementation 'androidx.core:core:1.13.1'
-    implementation 'androidx.lifecycle:lifecycle-service:2.8.0'
+
+    // lifecycle-service 2.6.2 is the last stable version that does NOT use
+    // Kotlin lambdas compiled as anonymous inner classes in a way that
+    // breaks on older ART runtimes (Android 12 / API 31).
+    implementation 'androidx.lifecycle:lifecycle-service:2.6.2'
+    implementation 'androidx.lifecycle:lifecycle-common:2.6.2'
+    implementation 'androidx.lifecycle:lifecycle-runtime:2.6.2'
+    implementation 'androidx.lifecycle:lifecycle-process:2.6.2'
 }
