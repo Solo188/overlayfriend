@@ -24,8 +24,9 @@ public class OverlayService extends Service {
     private static final String CHANNEL_ID = "endfield_overlay";
     private static final int    NOTIF_ID   = 1001;
 
-    public static final String EXTRA_PMX_PATH  = "pmx_path";
-    public static final String EXTRA_CHAR_NAME = "char_name";
+    public static final String EXTRA_PMX_PATH       = "pmx_path";
+    public static final String EXTRA_CHAR_NAME      = "char_name";
+    public static final String ACTION_REFRESH_SETTINGS = "REFRESH_SETTINGS";
 
     private static final String MOTIONS_BASE   = "/sdcard/Documents/Assistant/Models/";
     private static final long   TICK_INTERVAL  = 60_000L;
@@ -66,11 +67,18 @@ public class OverlayService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent != null && m_overlayView == null) {
-            m_charName = intent.getStringExtra(EXTRA_CHAR_NAME);
-            if (m_charName == null) m_charName = "DefaultChar";
-            String pmxPath = intent.getStringExtra(EXTRA_PMX_PATH);
-            addOverlayWindow(pmxPath);
+        if (intent != null) {
+            // Settings changed — update scale/opacity on the overlay
+            if (ACTION_REFRESH_SETTINGS.equals(intent.getAction())) {
+                if (m_overlayView != null) m_overlayView.applySettings();
+                return START_STICKY;
+            }
+            if (m_overlayView == null) {
+                m_charName = intent.getStringExtra(EXTRA_CHAR_NAME);
+                if (m_charName == null) m_charName = "DefaultChar";
+                String pmxPath = intent.getStringExtra(EXTRA_PMX_PATH);
+                addOverlayWindow(pmxPath);
+            }
         }
         return START_STICKY;
     }
