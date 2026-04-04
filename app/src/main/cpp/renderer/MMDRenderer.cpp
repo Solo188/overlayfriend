@@ -1,9 +1,23 @@
+/**
+ * MMDRenderer.cpp — OpenGL ES 3.0 renderer for PMX/MMD models (Saba library).
+ *
+ * Saba API summary used here:
+ *  - Vertices: GetPositions()/GetNormals()/GetUVs() + GetUpdate*() after animation
+ *  - SubMeshes: GetSubMeshes() → m_beginIndex, m_vertexCount, m_materialID
+ *  - MMDMaterial: m_diffuse(vec3), m_alpha(float), m_specular(vec3), m_ambient(vec3)
+ *  - Morphs: GetMorphManager()->GetMorph(name)->SetWeight(w)
+ *  - No unified MMDVertex struct; use 3 separate VBOs.
+ */
+
 #include "MMDRenderer.h"
+
 #include <android/log.h>
 #include <GLES3/gl3.h>
+
 #include <Saba/Model/MMD/PMXModel.h>
 #include <Saba/Model/MMD/MMDModel.h>
 #include <Saba/Model/MMD/MMDMaterial.h>
+
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -15,145 +29,479 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// Конструктор: инициализируем все нулями
-MMDRenderer::MMDRenderer() : 
-    m_glReady(false), m_vao(0), m_vboPos(0), m_vboNorm(0), 
-    m_vboUV(0), m_vboIBO(0), m_texturesLoaded(false) {}
+// ─── Shaders ─────────────────────────────────────────────────────────────────
 
-MMDRenderer::~MMDRenderer() {
-    if (m_vao != 0) glDeleteVertexArrays(1, &m_vao);
-    if (m_vboPos != 0) {
-        GLuint vbos[] = {m_vboPos, m_vboNorm, m_vboUV, m_vboIBO};
-        glDeleteBuffers(4, vbos);
-    }
+static const char* TOON_VERT = R"GLSL(#version 300 es
+precision highp float;
+
+layout(location = 0) in vec3 a_position;
+layout(location = 1) in vec3 a_normal;
+layout(location = 2) in vec2 a_uv;
+
+out vec3 v_normal;
+out vec2 v_uv;
+out vec3 v_worldPos;
+
+uniform mat4  u_mvp;
+uniform mat4  u_model;
+uniform vec2  u_positionOffset;
+uniform float u_scale;
+
+void main() {
+    vec4 worldPos = u_model * vec4(a_position, 1.0);
+    v_worldPos = worldPos.xyz;
+    v_normal   = normalize(mat3(transpose(inverse(u_model))) * a_normal);
+    v_uv       = a_uv;
+
+    vec4 clipPos  = u_mvp * vec4(a_position, 1.0);
+    clipPos.x    += u_positionOffset.x * clipPos.w;
+    clipPos.y    += u_positionOffset.y * clipPos.w;
+    clipPos.xyz  *= u_scale;
+    gl_Position   = clipPos;
 }
+)GLSL";
+
+static const char* TOON_FRAG = R"GLSL(#version 300 es
+precision highp float;
+
+in vec3 v_normal;
+in vec2 v_uv;
+in vec3 v_worldPos;
+
+out vec4 fragColor;
+
+uniform sampler2D u_texDiffuse;
+uniform int       u_hasTexture;
+uniform vec4      u_diffuse;    // rgb = diffuse color, a = material alpha
+uniform vec3      u_specular;
+uniform vec3      u_ambient;
+uniform float     u_globalAlpha;
+
+const vec3 LIGHT_DIR = normalize(vec3(0.5, 1.0, 0.8));
+const vec3 LIGHT_COL = vec3(1.0, 0.98, 0.95);
+
+void main() {
+    vec4 baseColor = u_diffuse;
+
+    // FIX: Clamp material alpha to at least 1.0 when no texture is present.
+    // Some PMX materials have m_alpha == 0.0 as a placeholder — this caused
+    // all untextured faces to be discarded, making the entire model invisible.
+    if (u_hasTexture == 0) {
+        baseColor.a = max(baseColor.a, 1.0);
+    }
+
+    if (u_hasTexture == 1) {
+        vec4 texColor = texture(u_texDiffuse, v_uv);
+        baseColor.rgb *= texColor.rgb;
+        baseColor.a   *= texColor.a;
+    }
+
+    if (baseColor.a * u_globalAlpha < 0.01) discard;
+
+    vec3  N     = normalize(v_normal);
+    float NdotL = max(dot(N, LIGHT_DIR), 0.0);
+    float toon  = NdotL > 0.75 ? 1.0 : NdotL > 0.35 ? 0.65 : 0.35;
+
+    vec3 ambient  = u_ambient * 0.4;
+    vec3 diffuse  = baseColor.rgb * LIGHT_COL * toon;
+    vec3 viewDir  = normalize(-v_worldPos);
+    vec3 halfDir  = normalize(LIGHT_DIR + viewDir);
+    float spec    = pow(max(dot(N, halfDir), 0.0), 32.0) * toon;
+    vec3 specular = u_specular * spec * 0.4;
+
+    fragColor = vec4(ambient + diffuse + specular, baseColor.a * u_globalAlpha);
+}
+)GLSL";
+
+static const char* OUTLINE_VERT = R"GLSL(#version 300 es
+precision highp float;
+
+layout(location = 0) in vec3 a_position;
+layout(location = 1) in vec3 a_normal;
+
+uniform mat4  u_mvp;
+uniform float u_outlineWidth;
+uniform vec2  u_positionOffset;
+uniform float u_scale;
+
+void main() {
+    vec3 expanded = a_position + a_normal * u_outlineWidth;
+    vec4 clipPos  = u_mvp * vec4(expanded, 1.0);
+    clipPos.x    += u_positionOffset.x * clipPos.w;
+    clipPos.y    += u_positionOffset.y * clipPos.w;
+    clipPos.xyz  *= u_scale;
+    gl_Position   = clipPos;
+}
+)GLSL";
+
+static const char* OUTLINE_FRAG = R"GLSL(#version 300 es
+precision highp float;
+
+out vec4 fragColor;
+
+uniform vec4  u_outlineColor;
+uniform float u_globalAlpha;
+
+void main() {
+    fragColor = vec4(u_outlineColor.rgb, u_outlineColor.a * u_globalAlpha);
+}
+)GLSL";
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+static std::string normalizePath(const std::string& p) {
+    std::string out = p;
+    for (char& c : out) if (c == '\\') c = '/';
+    return out;
+}
+
+static unsigned char* tryLoadTexture(const std::string& path, int* w, int* h, int* comp) {
+    stbi_set_flip_vertically_on_load(0);
+    unsigned char* data = stbi_load(path.c_str(), w, h, comp, STBI_rgb_alpha);
+    return data;
+}
+
+// ─── Constructor / Destructor ───────────────────────────────────────────────
+// These MUST be defined in the .cpp file because the class uses std::unique_ptr
+// with incomplete types (forward-declared in the header). The compiler needs to
+// know the full type at the point of destruction, which only the .cpp sees after
+// all headers are included.
+MMDRenderer::MMDRenderer()  = default;
+MMDRenderer::~MMDRenderer() { shutdown(); }
+
+// ─── Lifecycle ────────────────────────────────────────────────────────────────
 
 bool MMDRenderer::initialize(int width, int height) {
-    glViewport(0, 0, width, height);
-    glClearColor(0.0f, 0.0f, 0.0f, 0.0f); 
-    glEnable(GL_DEPTH_TEST);
+    m_width  = width;
+    m_height = height;
 
-    m_toonShader = std::make_unique<ShaderProgram>();
-    // Простой шейдер, который рисует модель даже без текстур
-    const char* vs = R"(#version 300 es
-        layout(location = 0) in vec3 a_pos;
-        layout(location = 1) in vec3 a_norm;
-        layout(location = 2) in vec2 a_uv;
-        uniform mat4 u_mvp;
-        out vec2 v_uv;
-        void main() {
-            v_uv = a_uv;
-            gl_Position = u_mvp * vec4(a_pos, 1.0);
-        })";
+    m_toonShader    = std::make_unique<ShaderProgram>();
+    m_outlineShader = std::make_unique<ShaderProgram>();
 
-    const char* fs = R"(#version 300 es
-        precision highp float;
-        in vec2 v_uv;
-        uniform sampler2D u_texDiffuse;
-        uniform int u_hasTexture;
-        uniform vec4 u_diffuse;
-        out vec4 fragColor;
-        void main() {
-            vec4 col = u_diffuse;
-            if (u_hasTexture != 0) col *= texture(u_texDiffuse, v_uv);
-            if (col.a < 0.1) discard; // Убираем совсем прозрачные части
-            fragColor = col;
-        })";
-
-    m_toonShader->build(vs, fs);
-
-    float aspect = (float)width / (float)height;
-    m_proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 1000.0f);
-    // Отодвигаем камеру на 40 единиц назад, чтобы видеть всю Yvonne
-    m_view = glm::lookAt(glm::vec3(0, 10, 40), glm::vec3(0, 10, 0), glm::vec3(0, 1, 0));
-
-    m_glReady = true;
-    return true;
-}
-
-bool MMDRenderer::loadPMXModel(const std::string& path) {
-    auto pmxModel = std::make_unique<saba::PMXModel>();
-    if (!pmxModel->Load(path)) return false;
-
-    m_model = std::make_unique<saba::MMDModel>();
-    m_model->Initialize(pmxModel.get());
-
-    // ЗАПОМИНАЕМ ПАПКУ МОДЕЛИ (Важно для текстур!)
-    std::string modelDir = path.substr(0, path.find_last_of("/\\") + 1);
-
-    m_textures.clear();
-    for (const auto& mat : pmxModel->GetMaterials()) {
-        // Склеиваем путь: Папка + Имя текстуры из PMX
-        std::string fullTexPath = modelDir + mat.m_texture;
-        // Исправляем обратные слеши из Windows-формата PMX
-        for (char &c : fullTexPath) if (c == '\\') c = '/';
-
-        GLuint texId = 0;
-        int w, h, comp;
-        unsigned char* data = stbi_load(fullTexPath.c_str(), &w, &h, &comp, 4);
-        if (data) {
-            glGenTextures(1, &texId);
-            glBindTexture(GL_TEXTURE_2D, texId);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-            glGenerateMipmap(GL_TEXTURE_2D);
-            stbi_image_free(data);
-            LOGI("Texture Loaded: %s", fullTexPath.c_str());
-        }
-        m_textures.push_back(texId);
+    if (!m_toonShader->build(TOON_VERT, TOON_FRAG)) {
+        LOGE("Toon shader failed"); return false;
+    }
+    if (!m_outlineShader->build(OUTLINE_VERT, OUTLINE_FRAG)) {
+        LOGE("Outline shader failed"); return false;
     }
 
-    buildVAO();
+    glViewport(0, 0, width, height);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glClearColor(0.f, 0.f, 0.f, 0.f);
+
+    LOGI("initialize OK (%dx%d)", width, height);
     return true;
 }
 
+void MMDRenderer::shutdown() {
+    for (GLuint t : m_textures) if (t) glDeleteTextures(1, &t);
+    m_textures.clear();
+    if (m_vboPos)  { glDeleteBuffers(1, &m_vboPos);       m_vboPos  = 0; }
+    if (m_vboNorm) { glDeleteBuffers(1, &m_vboNorm);      m_vboNorm = 0; }
+    if (m_vboUV)   { glDeleteBuffers(1, &m_vboUV);        m_vboUV   = 0; }
+    if (m_ibo)     { glDeleteBuffers(1, &m_ibo);          m_ibo     = 0; }
+    if (m_vao)     { glDeleteVertexArrays(1, &m_vao);     m_vao     = 0; }
+    if (m_toonShader)    m_toonShader->destroy();
+    if (m_outlineShader) m_outlineShader->destroy();
+    m_model.reset();
+    m_modelLoaded = false;
+    LOGI("shutdown complete");
+}
+
+// ─── Model loading ────────────────────────────────────────────────────────────
+
+bool MMDRenderer::loadPMXModel(const std::string& pmxPath) {
+    LOGI("loadPMXModel: %s", pmxPath.c_str());
+
+    if (m_modelLoaded) {
+        for (GLuint t : m_textures) glDeleteTextures(1, &t);
+        m_textures.clear();
+        if (m_vboPos)  { glDeleteBuffers(1, &m_vboPos);   m_vboPos  = 0; }
+        if (m_vboNorm) { glDeleteBuffers(1, &m_vboNorm);  m_vboNorm = 0; }
+        if (m_vboUV)   { glDeleteBuffers(1, &m_vboUV);    m_vboUV   = 0; }
+        if (m_ibo)     { glDeleteBuffers(1, &m_ibo);      m_ibo     = 0; }
+        if (m_vao)     { glDeleteVertexArrays(1, &m_vao); m_vao     = 0; }
+        m_model.reset();
+        m_modelLoaded = false;
+    }
+
+    m_model = std::make_unique<saba::PMXModel>();
+    std::string dir = pmxPath.substr(0, pmxPath.find_last_of("/\\"));
+    // Store the model directory so loadTextures() can resolve relative paths.
+    m_modelDir = dir;
+
+    if (!m_model->Load(pmxPath, dir)) {
+        LOGE("PMXModel::Load failed"); m_model.reset(); return false;
+    }
+    m_model->InitializeAnimation();
+
+    buildVAO();
+    loadTextures();
+
+    m_modelLoaded = true;
+    LOGI("PMX loaded: %s  verts=%zu  mats=%zu  subMeshes=%zu",
+         pmxPath.c_str(),
+         m_model->GetVertexCount(),
+         m_model->GetMaterialCount(),
+         m_model->GetSubMeshCount());
+    return true;
+}
+
+// ─── VAO ─────────────────────────────────────────────────────────────────────
+
 void MMDRenderer::buildVAO() {
+    if (!m_model) return;
+    size_t vCount      = m_model->GetVertexCount();
+    size_t iCount      = m_model->GetIndexCount();
+    size_t idxElemSize = m_model->GetIndexElementSize();
+    const void* rawIdx = m_model->GetIndices();
+
     glGenVertexArrays(1, &m_vao);
     glBindVertexArray(m_vao);
 
-    auto vCount = m_model->GetVertexCount();
-    
+    // Positions (dynamic — updated every frame via uploadVertices)
     glGenBuffers(1, &m_vboPos);
     glBindBuffer(GL_ARRAY_BUFFER, m_vboPos);
-    glBufferData(GL_ARRAY_BUFFER, vCount * sizeof(glm::vec3), m_model->GetPositions(), GL_DYNAMIC_DRAW);
+    // Use GetPositions() (bind-pose) for the initial buffer allocation.
+    // GetUpdatePositions() is only valid after the first UpdateAllAnimation call.
+    // uploadVertices() overwrites this data with GetUpdatePositions() each frame.
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vCount * sizeof(glm::vec3)),
+                 m_model->GetPositions(), GL_DYNAMIC_DRAW);
     glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, 0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), nullptr);
 
-    glGenBuffers(1, &m_vboIBO);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_vboIBO);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, m_model->GetIndexCount() * 4, m_model->GetIndices(), GL_STATIC_DRAW);
+    // Normals (dynamic — updated every frame via uploadVertices)
+    glGenBuffers(1, &m_vboNorm);
+    glBindBuffer(GL_ARRAY_BUFFER, m_vboNorm);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vCount * sizeof(glm::vec3)),
+                 m_model->GetNormals(), GL_DYNAMIC_DRAW);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), nullptr);
 
+    // UVs (static)
+    glGenBuffers(1, &m_vboUV);
+    glBindBuffer(GL_ARRAY_BUFFER, m_vboUV);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vCount * sizeof(glm::vec2)),
+                 m_model->GetUVs(), GL_STATIC_DRAW);
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(glm::vec2), nullptr);
+
+    // Indices — expand to uint32 if needed
+    glGenBuffers(1, &m_ibo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_ibo);
+    if (idxElemSize == 4) {
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                     (GLsizeiptr)(iCount * sizeof(uint32_t)), rawIdx, GL_STATIC_DRAW);
+    } else {
+        std::vector<uint32_t> expanded(iCount);
+        if (idxElemSize == 1) {
+            const uint8_t* s = (const uint8_t*)rawIdx;
+            for (size_t i = 0; i < iCount; ++i) expanded[i] = s[i];
+        } else {
+            const uint16_t* s = (const uint16_t*)rawIdx;
+            for (size_t i = 0; i < iCount; ++i) expanded[i] = s[i];
+        }
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                     (GLsizeiptr)(iCount * sizeof(uint32_t)),
+                     expanded.data(), GL_STATIC_DRAW);
+    }
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+}
+
+// ─── Textures ─────────────────────────────────────────────────────────────────
+
+void MMDRenderer::loadTextures() {
+    if (!m_model) return;
+    size_t matCount = m_model->GetMaterialCount();
+    m_textures.assign(matCount, 0);
+
+    int loaded = 0, skipped = 0, failed = 0;
+    for (size_t i = 0; i < matCount; ++i) {
+        const auto& mat = m_model->GetMaterials()[i];
+        if (mat.m_texture.empty()) { skipped++; continue; }
+
+        std::string path = normalizePath(mat.m_texture);
+
+        // FIX: Saba may store texture paths as relative (e.g. "tex/body.png").
+        // If the path is not absolute, prepend the model directory so that
+        // stbi_load() can find the file on the filesystem.
+        if (path.empty() || path[0] != '/') {
+            path = m_modelDir + "/" + path;
+        }
+        LOGI("Texture[%zu]: %s", i, path.c_str());
+
+        int w = 0, h = 0, comp = 0;
+        unsigned char* data = tryLoadTexture(path, &w, &h, &comp);
+        if (!data) {
+            LOGE("Tex FAILED[%zu]: %s", i, path.c_str());
+            failed++;
+            continue;
+        }
+
+        glGenTextures(1, &m_textures[i]);
+        glBindTexture(GL_TEXTURE_2D, m_textures[i]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+        glGenerateMipmap(GL_TEXTURE_2D);
+        stbi_image_free(data);
+        loaded++;
+    }
+    LOGI("Textures: %d loaded, %d failed out of %zu materials", loaded, failed, matCount);
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+// ─── Per-frame upload ─────────────────────────────────────────────────────────
+
+void MMDRenderer::uploadVertices() {
+    if (!m_model || !m_vboPos || !m_vboNorm) return;
+
+    const glm::vec3* updPos  = m_model->GetUpdatePositions();
+    const glm::vec3* updNorm = m_model->GetUpdateNormals();
+
+    // Guard: GetUpdate* return nullptr if UpdateAllAnimation has never been
+    // called.  Skip the GPU upload in that case — the bind-pose data
+    // uploaded in buildVAO() will be used until the first animation frame.
+    if (!updPos || !updNorm) return;
+
+    size_t n = m_model->GetVertexCount();
+
+    // FIX: Bind VBO explicitly before glBufferSubData.  The VAO stores
+    // attribute format pointers but NOT which ARRAY_BUFFER is currently
+    // bound — glBufferSubData operates on the bound ARRAY_BUFFER, not the VAO.
+    glBindBuffer(GL_ARRAY_BUFFER, m_vboPos);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(n * sizeof(glm::vec3)), updPos);
+
+    glBindBuffer(GL_ARRAY_BUFFER, m_vboNorm);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(n * sizeof(glm::vec3)), updNorm);
+
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+// ─── Surface / transform ──────────────────────────────────────────────────────
+
+void MMDRenderer::onSurfaceChanged(int w, int h) {
+    m_width = w; m_height = h;
+    glViewport(0, 0, w, h);
+    LOGI("onSurfaceChanged %dx%d", w, h);
+}
+
+void MMDRenderer::onTouchDown(float x, float y) {
+    LOGI("onTouchDown (%.1f, %.1f)", x, y);
+}
+
+void MMDRenderer::setTransform(float x, float y, float scale, float alpha) {
+    m_posX = x; m_posY = y; m_scale = scale; m_alpha = alpha;
+}
+
+void MMDRenderer::setMorphWeight(const std::string& name, float w) {
+    if (!m_model || !m_modelLoaded) return;
+    auto* mgr   = m_model->GetMorphManager();
+    auto* morph = mgr ? mgr->GetMorph(name) : nullptr;
+    if (morph) morph->SetWeight(w);
+}
+
+// ─── Render ───────────────────────────────────────────────────────────────────
+
+void MMDRenderer::render(float /*dt*/) {
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    if (!m_modelLoaded || !m_model) return;
+
+    // NOTE: Animation update (BeginAnimation/UpdateAllAnimation/etc.) is driven
+    // by VMDManager::update() which is called from nativeRender() before this
+    // function.  We only need to upload the already-updated vertex data here.
+    uploadVertices();
+
+    // Camera: MMD/Saba coordinate system.
+    // A typical PMX character is ~20 units tall (center of mass ~10 units up).
+    // eye at (0, 10, 40), looking at (0, 10, 0), FOV 45° frames the full body
+    // with a small margin in a 400×600 overlay window.
+    // near=0.1, far=500 covers the full Saba scene range.
+    float aspect = (m_height > 0)
+        ? static_cast<float>(m_width) / static_cast<float>(m_height)
+        : 1.f;
+    glm::mat4 proj  = glm::perspective(glm::radians(45.f), aspect, 0.1f, 500.f);
+    glm::mat4 view  = glm::lookAt(glm::vec3(0.f, 10.f, 40.f),
+                                  glm::vec3(0.f, 10.f,  0.f),
+                                  glm::vec3(0.f,  1.f,  0.f));
+    glm::mat4 model = glm::mat4(1.f);
+    glm::mat4 mvp   = proj * view * model;
+
+    // Outline pass
+    glCullFace(GL_FRONT);
+    glEnable(GL_CULL_FACE);
+    m_outlineShader->use();
+    m_outlineShader->setUniformMat4("u_mvp",            glm::value_ptr(mvp));
+    m_outlineShader->setUniform1f  ("u_outlineWidth",   0.012f);
+    m_outlineShader->setUniform2f  ("u_positionOffset", m_posX, m_posY);
+    m_outlineShader->setUniform1f  ("u_scale",          m_scale);
+    m_outlineShader->setUniform4f  ("u_outlineColor",   0.05f, 0.05f, 0.05f, 1.f);
+    m_outlineShader->setUniform1f  ("u_globalAlpha",    m_alpha);
+    drawOutline();
+
+    // Toon pass
+    glCullFace(GL_BACK);
+    m_toonShader->use();
+    m_toonShader->setUniformMat4("u_mvp",            glm::value_ptr(mvp));
+    m_toonShader->setUniformMat4("u_model",          glm::value_ptr(model));
+    m_toonShader->setUniform2f  ("u_positionOffset", m_posX, m_posY);
+    m_toonShader->setUniform1f  ("u_scale",          m_scale);
+    m_toonShader->setUniform1f  ("u_globalAlpha",    m_alpha);
+    drawModel();
+
+    glDisable(GL_CULL_FACE);
+}
+
+// ─── Draw calls ───────────────────────────────────────────────────────────────
+
+void MMDRenderer::drawModel() {
+    if (!m_vao || !m_model) return;
+    glBindVertexArray(m_vao);
+
+    const saba::MMDMaterial* mats  = m_model->GetMaterials();
+    const saba::MMDSubMesh*  sms   = m_model->GetSubMeshes();
+    size_t smCount = m_model->GetSubMeshCount();
+
+    for (size_t i = 0; i < smCount; ++i) {
+        const saba::MMDSubMesh&  sm  = sms[i];
+        const saba::MMDMaterial& mat = mats[sm.m_materialID];
+
+        m_toonShader->setUniform4f("u_diffuse",
+            mat.m_diffuse.r, mat.m_diffuse.g, mat.m_diffuse.b, mat.m_alpha);
+        m_toonShader->setUniform3f("u_specular",
+            mat.m_specular.r, mat.m_specular.g, mat.m_specular.b);
+        m_toonShader->setUniform3f("u_ambient",
+            mat.m_ambient.r, mat.m_ambient.g, mat.m_ambient.b);
+
+        size_t matIdx = static_cast<size_t>(sm.m_materialID);
+        GLuint texId  = (matIdx < m_textures.size()) ? m_textures[matIdx] : 0;
+        bool hasTex   = (texId != 0);
+        m_toonShader->setUniform1i("u_hasTexture", hasTex ? 1 : 0);
+        if (hasTex) {
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, texId);
+            m_toonShader->setUniform1i("u_texDiffuse", 0);
+        }
+
+        glDrawElements(GL_TRIANGLES,
+                       (GLsizei)sm.m_vertexCount,
+                       GL_UNSIGNED_INT,
+                       (void*)((uintptr_t)sm.m_beginIndex * sizeof(uint32_t)));
+    }
     glBindVertexArray(0);
 }
 
-void MMDRenderer::render(float deltaTime) {
-    if (!m_glReady || !m_model) return;
-
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_TEST);
-    m_model->Update();
-
-    m_toonShader->use();
-    glm::mat4 mvp = m_proj * m_view;
-    m_toonShader->setUniformMatrix4fv("u_mvp", glm::value_ptr(mvp));
-
+void MMDRenderer::drawOutline() {
+    if (!m_vao || !m_model) return;
     glBindVertexArray(m_vao);
-
-    auto sms = m_model->GetSubMeshes();
-    auto mats = m_model->GetPMXModel()->GetMaterials();
-
-    for (size_t i = 0; i < m_model->GetSubMeshCount(); ++i) {
-        const auto& sm = sms[i];
-        const auto& mat = mats[sm.m_materialID];
-
-        // Передаем цвет, даже если текстура не загрузится
-        m_toonShader->setUniform4f("u_diffuse", mat.m_diffuse.r, mat.m_diffuse.g, mat.m_diffuse.b, mat.m_alpha);
-        
-        if (sm.m_materialID < m_textures.size() && m_textures[sm.m_materialID] != 0) {
-            m_toonShader->setUniform1i("u_hasTexture", 1);
-            glBindTexture(GL_TEXTURE_2D, m_textures[sm.m_materialID]);
-        } else {
-            m_toonShader->setUniform1i("u_hasTexture", 0);
-        }
-
-        glDrawElements(GL_TRIANGLES, sm.m_vertexCount, GL_UNSIGNED_INT, (void*)(sm.m_beginIndex * 4));
-    }
+    glDrawElements(GL_TRIANGLES,
+                   (GLsizei)m_model->GetIndexCount(),
+                   GL_UNSIGNED_INT, nullptr);
+    glBindVertexArray(0);
 }

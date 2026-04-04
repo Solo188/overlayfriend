@@ -55,6 +55,10 @@ private:
 
     std::vector<GLuint> m_textures;   // one per material slot
 
+    // Directory containing the loaded PMX file — used to resolve relative
+    // texture paths stored inside the PMX material list.
+    std::string m_modelDir;
+
     float m_posX   = 0.f;
     float m_posY   = 0.f;
     float m_scale  = 1.f;
