@@ -1,5 +1,6 @@
 package com.endfield.overlayassistant.settings;
 
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.os.Bundle;
 import android.widget.SeekBar;
@@ -8,6 +9,7 @@ import android.widget.TextView;
 
 import androidx.appcompat.app.AppCompatActivity;
 
+import com.endfield.overlayassistant.OverlayService;
 import com.endfield.overlayassistant.R;
 
 public class SettingsActivity extends AppCompatActivity {
@@ -72,7 +74,10 @@ public class SettingsActivity extends AppCompatActivity {
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
                 float scale = 0.5f + (progress / 100f);
                 updateScaleLabel(scale);
-                if (fromUser) saveFloat(KEY_SCALE, scale);
+                if (fromUser) {
+                    saveFloat(KEY_SCALE, scale);
+                    notifyService();
+                }
             }
             @Override public void onStartTrackingTouch(SeekBar s) {}
             @Override public void onStopTrackingTouch(SeekBar s) {}
@@ -83,7 +88,10 @@ public class SettingsActivity extends AppCompatActivity {
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
                 float opacity = progress / 100f;
                 updateOpacityLabel(opacity);
-                if (fromUser) saveFloat(KEY_OPACITY, opacity);
+                if (fromUser) {
+                    saveFloat(KEY_OPACITY, opacity);
+                    notifyService();
+                }
             }
             @Override public void onStartTrackingTouch(SeekBar s) {}
             @Override public void onStopTrackingTouch(SeekBar s) {}
@@ -98,6 +106,13 @@ public class SettingsActivity extends AppCompatActivity {
 
     private void saveFloat(String key, float value) {
         m_prefs.edit().putFloat(key, value).apply();
+    }
+
+    private void notifyService() {
+        // Tell OverlayService to re-read scale/opacity from SharedPreferences
+        Intent i = new Intent(this, OverlayService.class);
+        i.setAction(OverlayService.ACTION_REFRESH_SETTINGS);
+        startService(i);
     }
 
     private void updateScaleLabel(float scale) {
