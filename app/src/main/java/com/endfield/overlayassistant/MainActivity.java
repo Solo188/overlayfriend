@@ -4,7 +4,9 @@ import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
 import android.provider.Settings;
 import android.widget.Button;
 import android.widget.Switch;
@@ -47,6 +49,16 @@ public class MainActivity extends AppCompatActivity {
             granted -> refreshPermissionSwitches()
         );
 
+    // Launcher for MANAGE_EXTERNAL_STORAGE special settings screen
+    private final ActivityResultLauncher<Intent> m_storagePermLauncher =
+        registerForActivityResult(
+            new ActivityResultContracts.StartActivityForResult(),
+            result -> {
+                // After user returns from settings — re-scan models
+                scanCharacterFolders();
+            }
+        );
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -57,14 +69,17 @@ public class MainActivity extends AppCompatActivity {
         bindViews();
         setupListeners();
         refreshPermissionSwitches();
-        scanCharacterFolders();
-        updateAffinityDisplay();
+
+        // Request full storage access if not granted — needed to read .pmx files
+        // from /sdcard/Documents/ which are not media files
+        requestStoragePermissionIfNeeded();
     }
 
     @Override
     protected void onResume() {
-        super.onResume();
+        super.onResume();;
         refreshPermissionSwitches();
+        scanCharacterFolders();
         updateAffinityDisplay();
     }
 
@@ -97,9 +112,36 @@ public class MainActivity extends AppCompatActivity {
 
         m_btnStartStop.setOnClickListener(v -> toggleService());
 
-        m_btnSettings.setOnClickListener(v -> {
-            startActivity(new Intent(this, com.endfield.overlayassistant.settings.SettingsActivity.class));
-        });
+        m_btnSettings.setOnClickListener(v ->
+            startActivity(new Intent(this,
+                com.endfield.overlayassistant.settings.SettingsActivity.class)));
+    }
+
+    /**
+     * On Android 11+ (API 30+) reading arbitrary files from /sdcard/Documents/
+     * requires MANAGE_EXTERNAL_STORAGE. READ_EXTERNAL_STORAGE only covers
+     * media files; .pmx is not a media file so it requires full storage access.
+     */
+    private void requestStoragePermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (!Environment.isExternalStorageManager()) {
+                Toast.makeText(this,
+                    "Storage permission needed to find .pmx models",
+                    Toast.LENGTH_LONG).show();
+                Intent intent = new Intent(
+                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:" + getPackageName()));
+                m_storagePermLauncher.launch(intent);
+            } else {
+                // Already have permission — scan immediately
+                scanCharacterFolders();
+                updateAffinityDisplay();
+            }
+        } else {
+            // API 29 and below — READ_EXTERNAL_STORAGE is enough
+            scanCharacterFolders();
+            updateAffinityDisplay();
+        }
     }
 
     private void toggleService() {
@@ -108,7 +150,16 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         if (m_selectedPmxPath.isEmpty()) {
-            Toast.makeText(this, "Please select a character model first", Toast.LENGTH_SHORT).show();
+            // Check storage permission first
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                    && !Environment.isExternalStorageManager()) {
+                Toast.makeText(this,
+                    "Grant 'All Files Access' permission first",
+                    Toast.LENGTH_LONG).show();
+                requestStoragePermissionIfNeeded();
+                return;
+            }
+            Toast.makeText(this, "No .pmx model found in Models/", Toast.LENGTH_SHORT).show();
             return;
         }
 
@@ -127,27 +178,45 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void scanCharacterFolders() {
+        // Check storage access before scanning
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                && !Environment.isExternalStorageManager()) {
+            m_tvCharSelected.setText("⚠ Grant 'All Files Access' in settings above");
+            return;
+        }
+
         File base = new File(MODELS_BASE);
         if (!base.exists()) {
             m_tvCharSelected.setText(R.string.no_models_found);
             return;
         }
+
+        // Search sub-folders (each is a character folder containing a .pmx)
         File[] chars = base.listFiles(File::isDirectory);
-        if (chars == null || chars.length == 0) {
-            m_tvCharSelected.setText(R.string.no_models_found);
+        if (chars != null) {
+            for (File charDir : chars) {
+                File[] pmxFiles = charDir.listFiles(
+                    (d, n) -> n.toLowerCase().endsWith(".pmx"));
+                if (pmxFiles != null && pmxFiles.length > 0) {
+                    m_selectedCharName = charDir.getName();
+                    m_selectedPmxPath  = pmxFiles[0].getAbsolutePath();
+                    m_tvCharSelected.setText(
+                        getString(R.string.selected_char, m_selectedCharName));
+                    return;
+                }
+            }
+        }
+
+        // Also check for .pmx files directly in the Models/ root (flat layout)
+        File[] rootPmx = base.listFiles((d, n) -> n.toLowerCase().endsWith(".pmx"));
+        if (rootPmx != null && rootPmx.length > 0) {
+            m_selectedCharName = rootPmx[0].getName().replaceFirst("\\.pmx$", "");
+            m_selectedPmxPath  = rootPmx[0].getAbsolutePath();
+            m_tvCharSelected.setText(
+                getString(R.string.selected_char, m_selectedCharName));
             return;
         }
 
-        for (File charDir : chars) {
-            File[] pmxFiles = charDir.listFiles((d, n) -> n.toLowerCase().endsWith(".pmx"));
-            if (pmxFiles != null && pmxFiles.length > 0) {
-                m_selectedCharName = charDir.getName();
-                m_selectedPmxPath  = pmxFiles[0].getAbsolutePath();
-                m_tvCharSelected.setText(
-                    getString(R.string.selected_char, m_selectedCharName));
-                return;
-            }
-        }
         m_tvCharSelected.setText(R.string.no_models_found);
     }
 
@@ -162,8 +231,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void updateAffinityDisplay() {
-        int score = m_affinity.getScore();
-        String tier = m_affinity.getTierName();
+        int score    = m_affinity.getScore();
+        String tier  = m_affinity.getTierName();
         m_tvAffinity.setText(getString(R.string.affinity_display, score, tier));
     }
 }
