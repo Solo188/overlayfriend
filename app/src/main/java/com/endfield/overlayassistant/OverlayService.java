@@ -21,26 +21,26 @@ import java.util.Calendar;
 
 public class OverlayService extends Service {
 
-    private static final String CHANNEL_ID   = "endfield_overlay";
-    private static final int    NOTIF_ID     = 1001;
+    private static final String CHANNEL_ID  = "endfield_overlay";
+    private static final int    NOTIF_ID    = 1001;
 
-    public static final String EXTRA_PMX_PATH   = "pmx_path";
-    public static final String EXTRA_CHAR_NAME  = "char_name";
+    public static final String EXTRA_PMX_PATH  = "pmx_path";
+    public static final String EXTRA_CHAR_NAME = "char_name";
 
     private static final String MOTIONS_BASE =
             "/sdcard/Documents/Assistant/Models/";
 
     private static final long TICK_INTERVAL_MS = 60_000L;
 
-    private WindowManager      m_windowManager;
-    private OverlayView        m_overlayView;
-    private NativeRenderer     m_nativeRenderer;
-    private AffinityManager    m_affinity;
-    private IAiAssistant       m_ai;
+    private WindowManager   m_windowManager;
+    private OverlayView     m_overlayView;
+    private NativeRenderer  m_nativeRenderer;
+    private AffinityManager m_affinity;
+    private IAiAssistant    m_ai;
 
-    private Handler            m_handler;
-    private String             m_charName   = "DefaultChar";
-    private boolean            m_nightMode  = false;
+    private Handler m_handler;
+    private String  m_charName  = "DefaultChar";
+    private boolean m_nightMode = false;
 
     private final Runnable m_tickRunnable = new Runnable() {
         @Override
@@ -59,9 +59,8 @@ public class OverlayService extends Service {
         m_affinity       = new AffinityManager(this);
         m_ai             = new AiAssistantImpl(this);
 
-        m_affinity.setOnTierChangedListener(tier -> {
-            m_nativeRenderer.nativeSetAffinityTier(tier);
-        });
+        m_affinity.setOnTierChangedListener(tier ->
+            m_nativeRenderer.nativeSetAffinityTier(tier));
 
         createNotificationChannel();
         startForeground(NOTIF_ID, buildNotification());
@@ -112,12 +111,16 @@ public class OverlayService extends Service {
         m_overlayView = new OverlayView(this, m_nativeRenderer, m_affinity, m_ai, params);
         m_windowManager.addView(m_overlayView, params);
 
-        new Thread(() -> {
-            if (pmxPath != null && !pmxPath.isEmpty()) {
-                m_overlayView.post(() -> m_overlayView.loadModel(pmxPath));
-                loadMotionsForCharacter(m_charName);
-            }
-        }).start();
+        // FIX: load model via OverlayView.loadModel() which correctly queues on the GL thread.
+        // Load motions only AFTER the model finishes loading — use a slight delay to let
+        // the GL thread process the model load first. The native side guards against
+        // loadMotion calls before loadModel via getModel() null checks.
+        if (pmxPath != null && !pmxPath.isEmpty()) {
+            m_overlayView.loadModel(pmxPath);
+            // Delay motion loading by 500 ms so the GL thread has time to finish
+            // nativeLoadModel before nativeLoadMotion calls arrive.
+            m_handler.postDelayed(() -> loadMotionsForCharacter(m_charName), 500);
+        }
 
         m_handler.postDelayed(m_tickRunnable, TICK_INTERVAL_MS);
         checkNightMode();
@@ -131,6 +134,8 @@ public class OverlayService extends Service {
     }
 
     private void loadMotionsForCharacter(String charName) {
+        if (m_overlayView == null) return;
+
         String base = MOTIONS_BASE + charName + "/motions/";
         String[] categories = {"idle", "touch", "night", "friend"};
 
@@ -143,18 +148,22 @@ public class OverlayService extends Service {
             if (vmds == null) continue;
 
             for (File vmd : vmds) {
-                m_overlayView.post(() ->
-                    m_nativeRenderer.nativeLoadMotion(vmd.getAbsolutePath(), cat)
-                );
+                // FIX: nativeLoadMotion must run on the GL thread (it uses MMDModel
+                // which was created on GL thread). Route through OverlayView.queueGLEvent.
+                final String vmdPath = vmd.getAbsolutePath();
+                final String category = cat;
+                m_overlayView.queueGLEvent(() ->
+                    m_nativeRenderer.nativeLoadMotion(vmdPath, category));
             }
         }
-        m_overlayView.post(() ->
-            m_nativeRenderer.nativePlayMotionCategory("idle")
-        );
+
+        // Play idle after all motions queued
+        m_overlayView.queueGLEvent(() ->
+            m_nativeRenderer.nativePlayMotionCategory("idle"));
     }
 
     private void checkNightMode() {
-        int hour     = Calendar.getInstance().get(Calendar.HOUR_OF_DAY);
+        int hour  = Calendar.getInstance().get(Calendar.HOUR_OF_DAY);
         boolean night = (hour >= 0 && hour < 6);
 
         if (night && !m_nightMode) {
@@ -197,7 +206,7 @@ public class OverlayService extends Service {
 
         return new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setContentTitle("Endfield Overlay")
-                .setContentText("Running - tap to open settings")
+                .setContentText("Running — tap to open settings")
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
                 .setContentIntent(openPi)
                 .addAction(android.R.drawable.ic_media_pause, "Stop", stopPi)
