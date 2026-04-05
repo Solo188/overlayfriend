@@ -53,49 +53,55 @@ precision highp float;
 in vec3 v_norm; in vec2 v_uv; in vec3 v_world;
 out vec4 fragColor;
 uniform sampler2D u_tex; uniform int u_hasTex;
-uniform vec4 u_diff;        // rgb=diffuse color, a=material alpha
+uniform vec4 u_diff;
 uniform vec3 u_spec;
 uniform float u_specPow;
 uniform vec3 u_amb;
 uniform float u_alpha;
 
-const vec3 LIGHT_DIR = normalize(vec3(0.5, 1.0, 0.7));
-const vec3 LIGHT_COL = vec3(1.0, 0.98, 0.95);
-// Ambient light color — simulates MMD's default ambient setting
-const vec3 AMB_LIGHT  = vec3(0.6, 0.6, 0.6);
+// Standard MMD default light setup
+// lightDir matches MMD default (upper-left-front)
+const vec3 LIGHT_DIR   = normalize(vec3(-0.5, 1.0, 0.5));
+// MMD default light color and ambient (both 154/255 ≈ 0.604)
+const float LIGHT_INT  = 0.604;
+const float AMB_INT    = 0.604;
 
 void main(){
-    // Base color from texture if present
-    vec4 texColor = vec4(1.0);
-    if(u_hasTex == 1) texColor = texture(u_tex, v_uv);
+    vec4 texColor = (u_hasTex == 1) ? texture(u_tex, v_uv) : vec4(1.0);
 
-    // MMD standard lighting model:
-    //   diffuse_contribution  = material_diffuse * texture * lightDiffuse * NdotL_toon
-    //   ambient_contribution  = material_ambient * texture * lightAmbient
-    //   total = diffuse + ambient (no double-add)
+    // Exact MMD lighting formula:
+    //   color = mat_diffuse * tex * (NdotL * lightColor + ambientColor)
+    //         + mat_ambient * lightAmbient
+    // This is the formula from the original MMD source code.
     vec3 N = normalize(v_norm);
     float NdotL = max(dot(N, LIGHT_DIR), 0.0);
 
-    // Soft toon step — gentler than before, closer to MMD default
-    float toon = NdotL > 0.6 ? 1.0 : mix(0.5, 1.0, NdotL / 0.6);
+    // Combined diffuse+ambient light factor (the MMD way)
+    // When NdotL=1: factor = 0.604+0.604 = 1.208 (slightly above tex color)
+    // When NdotL=0: factor = 0.604 (half brightness, nice shadow)
+    float lightFactor = NdotL * LIGHT_INT + AMB_INT;
 
-    // Diffuse: material_diffuse * texture_rgb * light_color * toon
-    vec3 diffuse = u_diff.rgb * texColor.rgb * LIGHT_COL * toon;
+    // Diffuse term: what the material/texture contributes under lighting
+    vec3 diffuse = u_diff.rgb * texColor.rgb * lightFactor;
 
-    // Ambient: material_ambient * texture_rgb * ambient_light
-    vec3 ambient = u_amb * texColor.rgb * AMB_LIGHT;
+    // Ambient term: self-illumination component
+    // u_amb for Yvonne = (0.75, 0.75, 0.75) → adds brightness in shadows
+    vec3 ambient = u_amb * AMB_INT;
 
-    // Specular (optional, keep subtle)
+    // Specular (subtle, only on lit surfaces)
     vec3 viewDir = normalize(-v_world);
     vec3 halfDir = normalize(LIGHT_DIR + viewDir);
-    float s = pow(max(dot(N, halfDir), 0.0), max(u_specPow, 1.0));
-    vec3 specular = u_spec * s * 0.3 * toon;
+    float spec   = pow(max(dot(N, halfDir), 0.0), max(u_specPow, 1.0)) * NdotL;
+    vec3 specular = u_spec * spec * LIGHT_INT;
 
-    // Final alpha: material alpha * texture alpha * global alpha
+    // Final color = diffuse + self-illumination ambient
+    vec3 finalRGB = diffuse + ambient;
+    finalRGB = clamp(finalRGB + specular, 0.0, 1.0);
+
     float finalA = u_diff.a * texColor.a * u_alpha;
     if(finalA < 0.01) discard;
 
-    fragColor = vec4(diffuse + ambient + specular, finalA);
+    fragColor = vec4(finalRGB, finalA);
 }
 )GLSL";
 
