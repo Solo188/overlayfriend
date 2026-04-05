@@ -15,6 +15,12 @@
 
 class MMDRenderer {
 public:
+    // Interaction state machine
+    //   None     — finger is down but not yet classified
+    //   Dragging — finger moved > DRAG_THRESHOLD before long-press fired
+    //   Rotating — long-press (1 s) completed; drag now rotates the model
+    enum class InteractMode { None, Dragging, Rotating };
+
     MMDRenderer();
     ~MMDRenderer();
 
@@ -24,12 +30,15 @@ public:
     bool loadPMXModel(const std::string& pmxPath);
     void onSurfaceChanged(int width, int height);
 
-    void render(float deltaTime);
+    // Main per-frame call.  dt is actual elapsed time (already clamped at call site).
+    void render(float dt);
 
+    // Touch events — dispatched from the GL-thread touch queue in native-lib.cpp
     void onTouchDown(float x, float y);
     void onTouchMove(float x, float y);
     void onTouchUp();
 
+    // Java-side anchor position/scale/alpha (unchanged by native drag)
     void setTransform(float x, float y, float scale, float alpha);
     void setMorphWeight(const std::string& morphName, float weight);
 
@@ -37,6 +46,12 @@ public:
 
     int surfaceWidth()  const { return m_width; }
     int surfaceHeight() const { return m_height; }
+
+    // Drag velocity in screen pixels/second, used by VMDManager for physics inertia.
+    float getDragVelX() const { return m_dragVelPxX; }
+    float getDragVelY() const { return m_dragVelPxY; }
+
+    InteractMode getInteractMode() const { return m_mode; }
 
 private:
     void buildVAO();
@@ -57,34 +72,49 @@ private:
     GLuint m_ibo     = 0;
 
     std::vector<GLuint> m_textures;
-
     std::string m_modelDir;
 
-    float m_posX   = 0.f;
-    float m_posY   = 0.f;
-    float m_scale  = 1.f;
-    float m_alpha  = 1.f;
+    // ── Position / scale / alpha set by Java ─────────────────────────────
+    float m_posX  = 0.f;
+    float m_posY  = 0.f;
+    float m_scale = 1.f;
+    float m_alpha = 1.f;
 
-    // ── Rotation state ────────────────────────────────────────────────────
-    // m_rotX — pitch (vertical drag, rotation around X axis), clamped ±90°
-    // m_rotY — yaw   (horizontal drag, rotation around Y axis), free
-    float m_rotX = 0.f;
-    float m_rotY = 0.f;
+    // ── Native drag offset (NDC units, additive over m_posX/Y) ───────────
+    // While dragging the model stays in place relative to the finger.
+    // When dragging ends the offset stays (model remains where it was left).
+    float m_nativeDragX = 0.f;
+    float m_nativeDragY = 0.f;
 
-    float m_lastTouchX = 0.f;
-    float m_lastTouchY = 0.f;
+    // ── Rotation (activated by long-press hold) ────────────────────────
+    float m_rotX = 0.f;   // pitch  ±90°
+    float m_rotY = 0.f;   // yaw    free
 
-    // Long-press gate: rotation is only enabled after the finger has been
-    // held still for LONG_PRESS_THRESHOLD seconds.
-    bool  m_touchHeld        = false;   // finger is currently down
-    float m_holdTimer        = 0.f;     // seconds elapsed since touch down
-    bool  m_rotationEnabled  = false;   // true after 1 s hold threshold
+    // ── Touch input state ─────────────────────────────────────────────────
+    float        m_touchDownX = 0.f;   // position when finger first landed
+    float        m_touchDownY = 0.f;
+    float        m_lastTouchX = 0.f;   // position at last MOVE event
+    float        m_lastTouchY = 0.f;
+    bool         m_fingerDown = false;
+    float        m_holdTimer  = 0.f;   // seconds since ACTION_DOWN with no move
+    InteractMode m_mode       = InteractMode::None;
 
-    static constexpr float LONG_PRESS_THRESHOLD = 1.0f;  // seconds
-    static constexpr float ROT_SENSITIVITY      = 0.45f; // degrees per pixel
+    // Accumulated pixel deltas since last render() — used to compute velocity
+    float m_accumDragPxX = 0.f;
+    float m_accumDragPxY = 0.f;
 
-    int  m_width  = 0;
-    int  m_height = 0;
+    // Smoothed drag velocity (pixels/second), exposed to VMDManager for physics
+    float m_dragVelPxX = 0.f;
+    float m_dragVelPxY = 0.f;
 
+    // ── Constants ─────────────────────────────────────────────────────────
+    // A finger must move more than this in pixels before we classify the
+    // gesture as a drag (rather than a potential long-press).
+    static constexpr float DRAG_THRESHOLD_PX   = 8.f;
+    static constexpr float LONG_PRESS_THRESHOLD = 1.0f;   // seconds
+    static constexpr float ROT_SENSITIVITY      = 0.45f;  // degrees per pixel
+
+    int  m_width       = 0;
+    int  m_height      = 0;
     bool m_modelLoaded = false;
 };

@@ -1,15 +1,26 @@
 /**
  * MMDRenderer.cpp — OpenGL ES 3.0 renderer for PMX/MMD models (Saba library).
  *
- * Touch rotation:
- *   Rotation is gated behind a 1-second long-press.  The user must hold the
- *   finger still for ≥ LONG_PRESS_THRESHOLD seconds before dragging rotates
- *   the model.  A tap (< threshold) is forwarded as a regular touch event
- *   (headpat / interaction) by the Java layer.
+ * Interaction modes
+ * ─────────────────
+ *   None     finger just landed, waiting to classify the gesture
+ *   Dragging finger moved > DRAG_THRESHOLD_PX before 1 s elapsed →
+ *            the model follows the finger in screen-space (NDC offset)
+ *   Rotating finger held still for ≥ 1 s → subsequent drag rotates the
+ *            model around its own X/Y axes without moving it on screen
  *
- * Brightness:
- *   Toon band values and ambient are intentionally kept slightly below 1.0
- *   to avoid the washed-out look on high-luminance AMOLED displays.
+ * Drag position
+ * ─────────────
+ *   The model's screen position is the sum of:
+ *     m_posX/Y — set by Java via setTransform() (anchor / initial pos)
+ *     m_nativeDragX/Y — accumulated NDC offset from native drag gestures
+ *   This means drag works without any Java-side changes.
+ *
+ * Drag velocity → physics inertia
+ * ────────────────────────────────
+ *   getDragVelX/Y() exposes smoothed pixel velocity (px/s) to VMDManager,
+ *   which uses it to tilt the Bullet physics gravity so hair/clothes lag
+ *   behind proportionally to how fast the model is being dragged.
  */
 
 #include "MMDRenderer.h"
@@ -61,6 +72,7 @@ void main() {
     v_uv       = a_uv;
 
     vec4 clipPos  = u_mvp * vec4(a_position, 1.0);
+    // u_positionOffset is in NDC; multiply by w to convert back to clip space
     clipPos.x    += u_positionOffset.x * clipPos.w;
     clipPos.y    += u_positionOffset.y * clipPos.w;
     clipPos.xyz  *= u_scale;
@@ -87,9 +99,7 @@ uniform float     u_globalAlpha;
 const vec3 LIGHT_DIR  = normalize(vec3(0.5, 1.0, 0.8));
 const vec3 LIGHT_COL  = vec3(1.0, 0.98, 0.95);
 const vec3 CAMERA_POS = vec3(0.0, 10.0, 40.0);
-
-// Ambient slightly reduced so the model looks natural rather than washed-out.
-// Was vec3(0.22, 0.18, 0.16) — reduced by ~25 % across all channels.
+// Slightly darker ambient — reduced ~25 % from the original 0.22/0.18/0.16
 const vec3 SCENE_AMB  = vec3(0.16, 0.13, 0.11);
 
 void main() {
@@ -109,25 +119,22 @@ void main() {
     vec3  N     = normalize(v_normal);
     float NdotL = max(dot(N, LIGHT_DIR), 0.0);
 
-    // Toon bands — slightly darker than before to avoid AMOLED overexposure.
-    // Previous values: 0.78 / 0.58 / 0.38
-    // New values:      0.68 / 0.50 / 0.32  (≈12 % reduction)
+    // Toon bands at 68 / 50 / 32  (≈12 % darker than the original 78/58/38)
     float toon = NdotL > 0.75 ? 0.68 : NdotL > 0.35 ? 0.50 : 0.32;
 
     vec3 ambientLight = max(u_ambient, SCENE_AMB);
     vec3 litColor = albedo * ambientLight + albedo * LIGHT_COL * toon;
 
-    vec3  viewDir  = normalize(CAMERA_POS - v_worldPos);
-    vec3  halfDir  = normalize(LIGHT_DIR + viewDir);
-    float spec     = pow(max(dot(N, halfDir), 0.0), 48.0) * (toon / 0.68);
-    vec3  specular = u_specular * spec * 0.25;
+    vec3  viewDir = normalize(CAMERA_POS - v_worldPos);
+    vec3  halfDir = normalize(LIGHT_DIR + viewDir);
+    float spec    = pow(max(dot(N, halfDir), 0.0), 48.0) * (toon / 0.68);
+    litColor     += u_specular * spec * 0.25;
 
-    // Saturation boost reduced from 1.30 to 1.15 to keep colours vivid
-    // without amplifying the overall luminance.
+    // Saturation boost 1.15 — vivid but not over-bright
     float lum  = dot(litColor, vec3(0.299, 0.587, 0.114));
     litColor   = mix(vec3(lum), litColor, 1.15);
 
-    fragColor = vec4(litColor + specular, alpha * u_globalAlpha);
+    fragColor = vec4(litColor, alpha * u_globalAlpha);
 }
 )GLSL";
 
@@ -173,11 +180,6 @@ static std::string normalizePath(const std::string& p) {
     return out;
 }
 
-static unsigned char* tryLoadTexture(const std::string& path, int* w, int* h, int* comp) {
-    stbi_set_flip_vertically_on_load(1);
-    return stbi_load(path.c_str(), w, h, comp, STBI_rgb_alpha);
-}
-
 // ─── Constructor / Destructor ─────────────────────────────────────────────────
 
 MMDRenderer::MMDRenderer()  = default;
@@ -212,11 +214,11 @@ bool MMDRenderer::initialize(int width, int height) {
 void MMDRenderer::shutdown() {
     for (GLuint t : m_textures) if (t) glDeleteTextures(1, &t);
     m_textures.clear();
-    if (m_vboPos)  { glDeleteBuffers(1, &m_vboPos);       m_vboPos  = 0; }
-    if (m_vboNorm) { glDeleteBuffers(1, &m_vboNorm);      m_vboNorm = 0; }
-    if (m_vboUV)   { glDeleteBuffers(1, &m_vboUV);        m_vboUV   = 0; }
-    if (m_ibo)     { glDeleteBuffers(1, &m_ibo);          m_ibo     = 0; }
-    if (m_vao)     { glDeleteVertexArrays(1, &m_vao);     m_vao     = 0; }
+    if (m_vboPos)  { glDeleteBuffers(1, &m_vboPos);   m_vboPos  = 0; }
+    if (m_vboNorm) { glDeleteBuffers(1, &m_vboNorm);  m_vboNorm = 0; }
+    if (m_vboUV)   { glDeleteBuffers(1, &m_vboUV);    m_vboUV   = 0; }
+    if (m_ibo)     { glDeleteBuffers(1, &m_ibo);      m_ibo     = 0; }
+    if (m_vao)     { glDeleteVertexArrays(1, &m_vao); m_vao     = 0; }
     if (m_toonShader)    m_toonShader->destroy();
     if (m_outlineShader) m_outlineShader->destroy();
     m_model.reset();
@@ -252,15 +254,6 @@ bool MMDRenderer::loadPMXModel(const std::string& pmxPath) {
 
     buildVAO();
     loadTextures();
-
-    {
-        const saba::MMDMaterial* mats = m_model->GetMaterials();
-        size_t mc = m_model->GetMaterialCount();
-        for (size_t i = 0; i < mc; ++i) {
-            if (mats[i].m_bothFace)
-                LOGI("Material[%zu] bothFace=TRUE  tex=%s", i, mats[i].m_texture.c_str());
-        }
-    }
 
     m_modelLoaded = true;
     LOGI("PMX loaded: %s  verts=%zu  mats=%zu  subMeshes=%zu",
@@ -334,6 +327,7 @@ void MMDRenderer::loadTextures() {
     size_t matCount = m_model->GetMaterialCount();
     m_textures.assign(matCount, 0);
 
+    stbi_set_flip_vertically_on_load(1);
     int loaded = 0, failed = 0;
     for (size_t i = 0; i < matCount; ++i) {
         const auto& mat = m_model->GetMaterials()[i];
@@ -341,11 +335,10 @@ void MMDRenderer::loadTextures() {
 
         std::string path = normalizePath(mat.m_texture);
         if (path.empty() || path[0] != '/') path = m_modelDir + "/" + path;
-        LOGI("Texture[%zu]: %s", i, path.c_str());
 
         int w = 0, h = 0, comp = 0;
-        unsigned char* data = tryLoadTexture(path, &w, &h, &comp);
-        if (!data) { LOGE("Tex FAILED[%zu]: %s", i, path.c_str()); failed++; continue; }
+        unsigned char* data = stbi_load(path.c_str(), &w, &h, &comp, STBI_rgb_alpha);
+        if (!data) { failed++; continue; }
 
         glGenTextures(1, &m_textures[i]);
         glBindTexture(GL_TEXTURE_2D, m_textures[i]);
@@ -362,76 +355,26 @@ void MMDRenderer::loadTextures() {
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-// ─── Per-frame upload ─────────────────────────────────────────────────────────
+// ─── Per-frame vertex upload ──────────────────────────────────────────────────
 
 void MMDRenderer::uploadVertices() {
     if (!m_model || !m_vboPos || !m_vboNorm) return;
-
-    const glm::vec3* updPos  = m_model->GetUpdatePositions();
-    const glm::vec3* updNorm = m_model->GetUpdateNormals();
-    if (!updPos || !updNorm) return;
-
+    const glm::vec3* pos  = m_model->GetUpdatePositions();
+    const glm::vec3* norm = m_model->GetUpdateNormals();
+    if (!pos || !norm) return;
     size_t n = m_model->GetVertexCount();
     glBindBuffer(GL_ARRAY_BUFFER, m_vboPos);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(n * sizeof(glm::vec3)), updPos);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(n * sizeof(glm::vec3)), pos);
     glBindBuffer(GL_ARRAY_BUFFER, m_vboNorm);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(n * sizeof(glm::vec3)), updNorm);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(n * sizeof(glm::vec3)), norm);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
-// ─── Surface / transform ──────────────────────────────────────────────────────
+// ─── Surface ─────────────────────────────────────────────────────────────────
 
 void MMDRenderer::onSurfaceChanged(int w, int h) {
     m_width = w; m_height = h;
     glViewport(0, 0, w, h);
-    LOGI("onSurfaceChanged %dx%d", w, h);
-}
-
-// ─── Touch / long-press rotation ─────────────────────────────────────────────
-//
-// Rotation is only activated after the user holds the finger for
-// LONG_PRESS_THRESHOLD seconds without lifting.  The holdTimer is advanced
-// inside render() using the frame's deltaTime.
-//
-// Visual feedback idea (optional, Java-side):
-//   Show a small ring animation after 1 s to signal that rotation mode is active.
-
-void MMDRenderer::onTouchDown(float x, float y) {
-    m_lastTouchX     = x;
-    m_lastTouchY     = y;
-    m_touchHeld      = true;
-    m_holdTimer      = 0.f;
-    m_rotationEnabled = false;
-    LOGI("onTouchDown (%.1f, %.1f) — waiting for long-press", x, y);
-}
-
-void MMDRenderer::onTouchMove(float x, float y) {
-    if (!m_rotationEnabled) {
-        // Before long-press fires: update last position so that the first
-        // drag after the threshold doesn't produce a huge rotation jump.
-        m_lastTouchX = x;
-        m_lastTouchY = y;
-        return;
-    }
-
-    float dx = x - m_lastTouchX;
-    float dy = y - m_lastTouchY;
-    m_lastTouchX = x;
-    m_lastTouchY = y;
-
-    constexpr float RAD_PER_PX = ROT_SENSITIVITY * (glm::pi<float>() / 180.f);
-    m_rotY += dx * RAD_PER_PX;
-    m_rotX += dy * RAD_PER_PX;
-
-    // Clamp pitch to ±90° to prevent flipping
-    constexpr float HALF_PI = glm::half_pi<float>();
-    m_rotX = std::max(-HALF_PI, std::min(HALF_PI, m_rotX));
-}
-
-void MMDRenderer::onTouchUp() {
-    m_touchHeld       = false;
-    m_rotationEnabled = false;
-    m_holdTimer       = 0.f;
 }
 
 void MMDRenderer::setTransform(float x, float y, float scale, float alpha) {
@@ -445,47 +388,142 @@ void MMDRenderer::setMorphWeight(const std::string& name, float w) {
     if (morph) morph->SetWeight(w);
 }
 
+// ─── Touch ───────────────────────────────────────────────────────────────────
+
+void MMDRenderer::onTouchDown(float x, float y) {
+    m_touchDownX  = x;
+    m_touchDownY  = y;
+    m_lastTouchX  = x;
+    m_lastTouchY  = y;
+    m_fingerDown  = true;
+    m_holdTimer   = 0.f;
+    m_mode        = InteractMode::None;
+    m_accumDragPxX = 0.f;
+    m_accumDragPxY = 0.f;
+}
+
+void MMDRenderer::onTouchMove(float x, float y) {
+    float dx = x - m_lastTouchX;
+    float dy = y - m_lastTouchY;
+    m_lastTouchX = x;
+    m_lastTouchY = y;
+
+    if (m_mode == InteractMode::None) {
+        // Check if the gesture crosses the drag threshold
+        float distFromDown = std::hypot(x - m_touchDownX, y - m_touchDownY);
+        if (distFromDown > DRAG_THRESHOLD_PX) {
+            m_mode = InteractMode::Dragging;
+            LOGI("Gesture classified: Dragging");
+        }
+        // Don't move anything yet — wait for classification
+        return;
+    }
+
+    if (m_mode == InteractMode::Dragging) {
+        // Translate pixel delta → NDC delta and apply to native drag offset.
+        // NDC runs –1..+1 over screenWidth/Height pixels, so:
+        //   dNDC_x =  dx * 2 / screenWidth
+        //   dNDC_y = -dy * 2 / screenHeight  (screen Y is flipped vs NDC)
+        if (m_width > 0 && m_height > 0) {
+            m_nativeDragX += dx *  2.f / static_cast<float>(m_width);
+            m_nativeDragY += dy * -2.f / static_cast<float>(m_height);
+        }
+        // Accumulate raw pixels for velocity computation in render()
+        m_accumDragPxX += dx;
+        m_accumDragPxY += dy;
+        return;
+    }
+
+    if (m_mode == InteractMode::Rotating) {
+        // Rotation: degrees per pixel → radians
+        constexpr float RAD_PER_PX = ROT_SENSITIVITY * (glm::pi<float>() / 180.f);
+        m_rotY += dx * RAD_PER_PX;
+        m_rotX += dy * RAD_PER_PX;
+        constexpr float HALF_PI = glm::half_pi<float>();
+        m_rotX = std::max(-HALF_PI, std::min(HALF_PI, m_rotX));
+    }
+}
+
+void MMDRenderer::onTouchUp() {
+    m_fingerDown = false;
+    m_holdTimer  = 0.f;
+    if (m_mode == InteractMode::Rotating) {
+        m_mode = InteractMode::None;
+    }
+    // Dragging mode: keep offset so the model stays where it was placed.
+    // Reset accumulated drag pixels so velocity decays naturally.
+    m_accumDragPxX = 0.f;
+    m_accumDragPxY = 0.f;
+}
+
 // ─── Render ───────────────────────────────────────────────────────────────────
 
 void MMDRenderer::render(float dt) {
     // ── Long-press timer ──────────────────────────────────────────────────
-    // Advance the hold timer while the finger is down and rotation hasn't
-    // fired yet.  Once the threshold is crossed, latch rotation on.
-    if (m_touchHeld && !m_rotationEnabled) {
+    // While the finger is held and the gesture hasn't been classified yet,
+    // accumulate time.  After LONG_PRESS_THRESHOLD seconds → rotation mode.
+    if (m_fingerDown && m_mode == InteractMode::None) {
         m_holdTimer += dt;
         if (m_holdTimer >= LONG_PRESS_THRESHOLD) {
-            m_rotationEnabled = true;
-            LOGI("Long-press threshold reached — rotation enabled");
+            m_mode = InteractMode::Rotating;
+            LOGI("Gesture classified: Rotating (long-press)");
         }
     }
 
+    // ── Drag velocity for physics inertia ─────────────────────────────────
+    // Compute velocity from accumulated pixel deltas since the last frame,
+    // then exponentially smooth it so physics gravity changes feel organic.
+    if (dt > 0.f) {
+        float rawVx = m_accumDragPxX / dt;
+        float rawVy = m_accumDragPxY / dt;
+        m_accumDragPxX = 0.f;
+        m_accumDragPxY = 0.f;
+
+        // EMA α = 0.35: responsive enough to capture fast flicks but smooth
+        // enough to suppress single-frame spikes from touch-event batching.
+        constexpr float EMA = 0.35f;
+        m_dragVelPxX = m_dragVelPxX * (1.f - EMA) + rawVx * EMA;
+        m_dragVelPxY = m_dragVelPxY * (1.f - EMA) + rawVy * EMA;
+    }
+
+    // ── Decay velocity after finger lifts ─────────────────────────────────
+    if (!m_fingerDown) {
+        m_dragVelPxX *= 0.85f;
+        m_dragVelPxY *= 0.85f;
+    }
+
+    // ── GL rendering ──────────────────────────────────────────────────────
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     if (!m_modelLoaded || !m_model) return;
 
     uploadVertices();
 
     float aspect = (m_height > 0)
-        ? static_cast<float>(m_width) / static_cast<float>(m_height)
-        : 1.f;
-    glm::mat4 proj  = glm::perspective(glm::radians(45.f), aspect, 0.1f, 500.f);
-    glm::mat4 view  = glm::lookAt(glm::vec3(0.f, 10.f, 40.f),
-                                  glm::vec3(0.f, 10.f,  0.f),
-                                  glm::vec3(0.f,  1.f,  0.f));
+                   ? static_cast<float>(m_width) / static_cast<float>(m_height)
+                   : 1.f;
+    glm::mat4 proj = glm::perspective(glm::radians(45.f), aspect, 0.1f, 500.f);
+    glm::mat4 view = glm::lookAt(glm::vec3(0.f, 10.f, 40.f),
+                                 glm::vec3(0.f, 10.f,  0.f),
+                                 glm::vec3(0.f,  1.f,  0.f));
 
-    // Model matrix with user-controlled rotation
+    // Rotation matrix: model rotates around its own centre
     glm::mat4 model = glm::mat4(1.f);
     model = glm::rotate(model, m_rotY, glm::vec3(0.f, 1.f, 0.f));
     model = glm::rotate(model, m_rotX, glm::vec3(1.f, 0.f, 0.f));
 
     glm::mat4 mvp = proj * view * model;
 
-    // Outline pass
+    // Total screen offset = Java anchor + native drag
+    float totalOffsetX = m_posX + m_nativeDragX;
+    float totalOffsetY = m_posY + m_nativeDragY;
+
+    // Outline pass (front-face culled, slightly expanded)
     glCullFace(GL_FRONT);
     glEnable(GL_CULL_FACE);
     m_outlineShader->use();
     m_outlineShader->setUniformMat4("u_mvp",            glm::value_ptr(mvp));
     m_outlineShader->setUniform1f  ("u_outlineWidth",   0.012f);
-    m_outlineShader->setUniform2f  ("u_positionOffset", m_posX, m_posY);
+    m_outlineShader->setUniform2f  ("u_positionOffset", totalOffsetX, totalOffsetY);
     m_outlineShader->setUniform1f  ("u_scale",          m_scale);
     m_outlineShader->setUniform4f  ("u_outlineColor",   0.05f, 0.05f, 0.05f, 1.f);
     m_outlineShader->setUniform1f  ("u_globalAlpha",    m_alpha);
@@ -496,7 +534,7 @@ void MMDRenderer::render(float dt) {
     m_toonShader->use();
     m_toonShader->setUniformMat4("u_mvp",            glm::value_ptr(mvp));
     m_toonShader->setUniformMat4("u_model",          glm::value_ptr(model));
-    m_toonShader->setUniform2f  ("u_positionOffset", m_posX, m_posY);
+    m_toonShader->setUniform2f  ("u_positionOffset", totalOffsetX, totalOffsetY);
     m_toonShader->setUniform1f  ("u_scale",          m_scale);
     m_toonShader->setUniform1f  ("u_globalAlpha",    m_alpha);
     drawModel();
@@ -546,7 +584,7 @@ void MMDRenderer::drawModel() {
     glBindVertexArray(0);
 }
 
-void MMDRenderer::drawOutline(const glm::mat4& mvp) {
+void MMDRenderer::drawOutline(const glm::mat4& /*mvp*/) {
     if (!m_vao || !m_model) return;
 
     const saba::MMDMaterial* mats  = m_model->GetMaterials();
@@ -557,9 +595,7 @@ void MMDRenderer::drawOutline(const glm::mat4& mvp) {
     for (size_t i = 0; i < smCount; ++i) {
         const saba::MMDSubMesh&  sm  = sms[i];
         const saba::MMDMaterial& mat = mats[sm.m_materialID];
-
         if (mat.m_bothFace || mat.m_edgeSize <= 0.0f) continue;
-
         glDrawElements(GL_TRIANGLES,
                        (GLsizei)sm.m_vertexCount,
                        GL_UNSIGNED_INT,
