@@ -80,6 +80,20 @@ private:
     float m_dragVelX = 0.f;
     float m_dragVelY = 0.f;
 
+    // Previous drag velocity — used to detect sudden stops / direction changes
+    // for triggering jiggle impulses.
+    float m_prevDragVelX = 0.f;
+    float m_prevDragVelY = 0.f;
+
+    // Accumulated jiggle impulse (decays over time, applied to heavy RBs).
+    // Non-zero when the model was stopped sharply or reversed direction.
+    float m_jiggleImpulseX = 0.f;
+    float m_jiggleImpulseY = 0.f;
+
+    // Whether a jiggle impulse was already fired this "event" so we don't
+    // repeat it on consecutive frames with the same velocity change.
+    bool  m_jiggleFired = false;
+
     float m_blinkTimer    = 0.f;
     float m_blinkInterval = 3.5f;
     float m_blinkPhase    = 0.f;
@@ -96,6 +110,7 @@ private:
     void applyBlend(float dt);
     void startNextLoop();
     void applyPhysicsInertia(void* model, float dt);
+    void applyJiggleImpulses(void* model);
 
     bool isCategoryUnlocked(const std::string& category) const;
 };

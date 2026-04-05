@@ -37,6 +37,18 @@
  *  clothes appear to "lag behind" with intensity proportional to speed.
  *  The effect blends in/out smoothly using an exponential filter on the
  *  gravity components.
+ *
+ * ── Jiggle / soft-body physics ───────────────────────────────────────────────
+ *
+ *  In addition to the gravity tilt, we detect sudden velocity changes
+ *  (sharp stops, reversals) and apply a brief impulse to the *heavy*
+ *  Bullet rigid bodies in the model.  Heavy rigid bodies correspond to
+ *  breast / hip / skirt bones in most MMD models.  Lighter rigid bodies
+ *  (hair strands) are unaffected by this secondary impulse, so only the
+ *  soft-body parts "jiggle" while hair reacts via gravity tilt alone.
+ *
+ *  Thresholds and scales are tuned for typical 30–60 fps gameplay on a
+ *  mid-range Android device.
  */
 
 #include "VMDManager.h"
@@ -65,16 +77,38 @@ static constexpr float MAX_ANIM_DT = 0.05f;   // 50 ms ≡ min 20 fps
 // Lower = smoother but less responsive to genuine FPS changes.
 static constexpr float PHYS_DT_EMA = 0.12f;
 
+// ── Hair / cloth inertia (gravity tilt) ──────────────────────────────────────
 // Scale factor: pixels/second → Bullet gravity offset (m/s²)
-// 2000 px/s drag → ~12 m/s² lateral gravity (roughly 1.2 g)
-static constexpr float DRAG_INERTIA_SCALE = 12.f / 2000.f;
+// 2000 px/s drag → ~18 m/s² lateral gravity (stronger than before, ~1.8 g)
+static constexpr float DRAG_INERTIA_SCALE = 18.f / 2000.f;
 
 // Maximum lateral gravity from inertia (keeps hair/cloth from going insane)
-static constexpr float MAX_LATERAL_GRAVITY = 15.f;
+static constexpr float MAX_LATERAL_GRAVITY = 20.f;
 
 // How fast the inertia gravity returns to normal when drag stops.
-// 0 = instant reset, 1 = never resets.  0.75 gives a natural settling feel.
-static constexpr float INERTIA_DECAY = 0.75f;
+// 0 = instant reset, 1 = never resets.  0.80 gives a natural settling feel.
+static constexpr float INERTIA_DECAY = 0.80f;
+
+// ── Jiggle impulse (soft-body, for breast / hip bones) ───────────────────────
+// Minimum velocity change (px/s) required to trigger a jiggle impulse.
+// Below this threshold small jitter in the velocity signal is ignored.
+static constexpr float JIGGLE_TRIGGER_DELTA = 150.f;   // px/s
+
+// Mass threshold: rigid bodies heavier than this (kg in Bullet units) receive
+// the jiggle impulse.  Hair strands are typically < 0.1 kg, breast/hip
+// bodies are typically 0.5–3 kg in MMD models.
+static constexpr float JIGGLE_MASS_THRESHOLD = 0.3f;
+
+// Pixels/second → impulse (Bullet units = kg·m/s).
+// Tuned so a fast flick (~1500 px/s stop) produces a visible ~2 Nm jiggle.
+static constexpr float JIGGLE_IMPULSE_SCALE = 0.0015f;
+
+// Maximum impulse magnitude per axis (prevents bodies from flying off).
+static constexpr float JIGGLE_MAX_IMPULSE = 3.0f;
+
+// Decay rate of the stored jiggle impulse per frame (multiplicative).
+// 0.0 = single-frame impulse; 0.85 = gradual fade over ~6 frames.
+static constexpr float JIGGLE_IMPULSE_DECAY = 0.0f;
 
 static const std::unordered_map<std::string, int> CATEGORY_TIER = {
     {"idle",   VMDManager::TIER_STRANGER},
@@ -161,7 +195,7 @@ void VMDManager::playCategory(const std::string& category) {
     LOGI("Playing [%s] idx=%zu dur=%.2fs", category.c_str(), idx, m_animDuration);
 }
 
-// ─── Physics inertia ──────────────────────────────────────────────────────────
+// ─── Physics inertia (gravity tilt — affects hair and all cloth) ──────────────
 
 void VMDManager::applyPhysicsInertia(void* modelRaw, float /*dt*/) {
     saba::MMDModel* model = static_cast<saba::MMDModel*>(modelRaw);
@@ -171,24 +205,110 @@ void VMDManager::applyPhysicsInertia(void* modelRaw, float /*dt*/) {
     btDiscreteDynamicsWorld* world = mmPhysics->GetDynamicsWorld();
     if (!world) return;
 
-    // Target lateral gravity from drag velocity (opposes motion = inertia)
+    // Target lateral gravity from drag velocity (opposes motion = inertia).
+    // Negative because we want the effect opposite to the drag direction.
     float targetGx = std::max(-MAX_LATERAL_GRAVITY,
                      std::min( MAX_LATERAL_GRAVITY, -m_dragVelX * DRAG_INERTIA_SCALE));
     float targetGz = std::max(-MAX_LATERAL_GRAVITY,
                      std::min( MAX_LATERAL_GRAVITY, -m_dragVelY * DRAG_INERTIA_SCALE));
 
-    // Smoothly blend current gravity toward target so transitions are gradual
+    // Smoothly blend current gravity toward target so transitions are gradual.
     btVector3 curG = world->getGravity();
     float newGx = curG.x() + (targetGx - curG.x()) * (1.f - INERTIA_DECAY);
     float newGz = curG.z() + (targetGz - curG.z()) * (1.f - INERTIA_DECAY);
 
-    // When there is no drag, blend back toward 0 on lateral axes
+    // When there is no drag, blend back toward 0 on lateral axes.
     if (std::abs(m_dragVelX) < 5.f && std::abs(m_dragVelY) < 5.f) {
         newGx *= INERTIA_DECAY;
         newGz *= INERTIA_DECAY;
     }
 
     world->setGravity(btVector3(newGx, -9.8f, newGz));
+}
+
+// ─── Jiggle impulse (applies only to heavy rigid bodies = breast / hip) ───────
+
+void VMDManager::applyJiggleImpulses(void* modelRaw) {
+    // Compute velocity delta since last frame.
+    float deltaVx = m_dragVelX - m_prevDragVelX;
+    float deltaVy = m_dragVelY - m_prevDragVelY;
+
+    float deltaMag = std::sqrt(deltaVx * deltaVx + deltaVy * deltaVy);
+
+    // Remember previous velocity for next frame.
+    m_prevDragVelX = m_dragVelX;
+    m_prevDragVelY = m_dragVelY;
+
+    // Check whether a new jiggle impulse should be fired.
+    bool trigger = (deltaMag >= JIGGLE_TRIGGER_DELTA) && !m_jiggleFired;
+
+    if (trigger) {
+        // Impulse direction: opposite to the velocity CHANGE (reaction force).
+        m_jiggleImpulseX = -deltaVx * JIGGLE_IMPULSE_SCALE;
+        m_jiggleImpulseY = -deltaVy * JIGGLE_IMPULSE_SCALE;
+
+        // Clamp impulse magnitude.
+        float mag = std::sqrt(m_jiggleImpulseX * m_jiggleImpulseX +
+                              m_jiggleImpulseY * m_jiggleImpulseY);
+        if (mag > JIGGLE_MAX_IMPULSE) {
+            float scale = JIGGLE_MAX_IMPULSE / mag;
+            m_jiggleImpulseX *= scale;
+            m_jiggleImpulseY *= scale;
+        }
+        m_jiggleFired = true;
+        LOGI("Jiggle impulse fired: (%.3f, %.3f)  dV=%.1f",
+             m_jiggleImpulseX, m_jiggleImpulseY, deltaMag);
+    } else if (deltaMag < JIGGLE_TRIGGER_DELTA * 0.5f) {
+        // Reset the "fired" guard once velocity has settled.
+        m_jiggleFired = false;
+    }
+
+    // Nothing to apply if there is no pending impulse.
+    if (std::abs(m_jiggleImpulseX) < 0.0001f && std::abs(m_jiggleImpulseY) < 0.0001f) {
+        return;
+    }
+
+    // Access the Bullet world through MMDPhysics.
+    saba::MMDModel* model = static_cast<saba::MMDModel*>(modelRaw);
+    auto* mmPhysics = model->GetMMDPhysics();
+    if (!mmPhysics) return;
+
+    btDiscreteDynamicsWorld* world = mmPhysics->GetDynamicsWorld();
+    if (!world) return;
+
+    // Apply impulse to rigid bodies whose mass exceeds the threshold.
+    // In MMD models, heavier bodies are typically breast / hip / buttock.
+    // Hair strands are lightweight and receive almost no impulse here —
+    // they are already handled by the gravity tilt in applyPhysicsInertia().
+    const btCollisionObjectArray& objs = world->getCollisionObjectArray();
+    for (int i = 0; i < objs.size(); ++i) {
+        btRigidBody* rb = btRigidBody::upcast(objs[i]);
+        if (!rb || rb->isStaticObject() || rb->isKinematicObject()) continue;
+
+        float mass = rb->getMass();
+        if (mass < JIGGLE_MASS_THRESHOLD) continue;   // lightweight = hair, skip
+
+        // Scale impulse by mass so heavier bodies react proportionally.
+        float scaledIx = m_jiggleImpulseX * mass;
+        float scaledIy = m_jiggleImpulseY * mass;
+
+        // Clamp per-body impulse to avoid instability on very high-mass bodies.
+        float bodyMag = std::sqrt(scaledIx * scaledIx + scaledIy * scaledIy);
+        if (bodyMag > JIGGLE_MAX_IMPULSE * mass) {
+            float s = JIGGLE_MAX_IMPULSE * mass / bodyMag;
+            scaledIx *= s;
+            scaledIy *= s;
+        }
+
+        // Apply as a central impulse (no angular torque) in the X-Z plane.
+        // Y is vertical (down) and is handled by gravity; X and Z are lateral.
+        rb->applyCentralImpulse(btVector3(scaledIx, 0.f, scaledIy));
+        rb->activate(true);  // wake up any sleeping bodies
+    }
+
+    // Decay the stored impulse (0.0 = single-frame spike; >0 = multi-frame fade).
+    m_jiggleImpulseX *= JIGGLE_IMPULSE_DECAY;
+    m_jiggleImpulseY *= JIGGLE_IMPULSE_DECAY;
 }
 
 // ─── Main update ──────────────────────────────────────────────────────────────
@@ -214,7 +334,8 @@ void VMDManager::update(float rawDeltaTime) {
     tickBlink(animDt);
     tickMouth(animDt);
     applyBlend(animDt);
-    applyPhysicsInertia(model, physDt);
+    applyPhysicsInertia(model, physDt);  // gravity tilt for hair / cloth
+    applyJiggleImpulses(model);          // impulse bursts for breast / hip
 
     if (m_pauseActive) {
         m_pauseTimer -= animDt;
