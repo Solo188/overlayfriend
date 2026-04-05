@@ -77,39 +77,52 @@ uniform vec3      u_specular;
 uniform vec3      u_ambient;
 uniform float     u_globalAlpha;
 
-const vec3 LIGHT_DIR = normalize(vec3(0.5, 1.0, 0.8));
-const vec3 LIGHT_COL = vec3(1.0, 0.98, 0.95);
+const vec3 LIGHT_DIR  = normalize(vec3(0.5, 1.0, 0.8));
+const vec3 LIGHT_COL  = vec3(1.0, 0.98, 0.95);
+// Camera position must match the C++ side: eye at (0, 10, 40).
+const vec3 CAMERA_POS = vec3(0.0, 10.0, 40.0);
+// Minimum scene ambient so back-faces are never pure black.
+const vec3 SCENE_AMB  = vec3(0.3, 0.3, 0.3);
 
 void main() {
-    vec4 baseColor = u_diffuse;
+    // --- Albedo ---------------------------------------------------------
+    // For game-converted PMX (e.g. Arknights Endfield), the texture IS the
+    // color. Material diffuse/ambient are lighting coefficients, NOT tints.
+    // Multiplying tex * diffuse_rgb darkened everything to near-black because
+    // game models store diffuse ≈ (0.5, 0.5, 0.5).
+    vec3  albedo = u_diffuse.rgb;   // fallback: use material color
+    float alpha  = u_diffuse.a;
 
-    // FIX: Clamp material alpha to at least 1.0 when no texture is present.
-    // Some PMX materials have m_alpha == 0.0 as a placeholder — this caused
-    // all untextured faces to be discarded, making the entire model invisible.
     if (u_hasTexture == 0) {
-        baseColor.a = max(baseColor.a, 1.0);
-    }
-
-    if (u_hasTexture == 1) {
+        // No texture: keep material diffuse as color, force visible alpha.
+        alpha = max(alpha, 1.0);
+    } else {
         vec4 texColor = texture(u_texDiffuse, v_uv);
-        baseColor.rgb *= texColor.rgb;
-        baseColor.a   *= texColor.a;
+        albedo = texColor.rgb;      // texture replaces diffuse rgb
+        alpha  = texColor.a * u_diffuse.a;
     }
 
-    if (baseColor.a * u_globalAlpha < 0.01) discard;
+    if (alpha * u_globalAlpha < 0.01) discard;
 
+    // --- Lighting -------------------------------------------------------
     vec3  N     = normalize(v_normal);
     float NdotL = max(dot(N, LIGHT_DIR), 0.0);
-    float toon  = NdotL > 0.75 ? 1.0 : NdotL > 0.35 ? 0.65 : 0.35;
+    // Toon bands. Shadow floor = 0.6 so back-faces stay visibly coloured.
+    float toon  = NdotL > 0.75 ? 1.0 : NdotL > 0.35 ? 0.78 : 0.6;
 
-    vec3 ambient  = u_ambient * 0.4;
-    vec3 diffuse  = baseColor.rgb * LIGHT_COL * toon;
-    vec3 viewDir  = normalize(-v_worldPos);
-    vec3 halfDir  = normalize(LIGHT_DIR + viewDir);
+    // Ambient: max of material ambient and scene minimum.
+    vec3 ambientLight = max(u_ambient, SCENE_AMB);
+
+    // Diffuse lighting applied to albedo.
+    vec3 litColor = albedo * (ambientLight + LIGHT_COL * toon);
+
+    // Specular highlight.
+    vec3  viewDir = normalize(CAMERA_POS - v_worldPos);
+    vec3  halfDir = normalize(LIGHT_DIR + viewDir);
     float spec    = pow(max(dot(N, halfDir), 0.0), 32.0) * toon;
-    vec3 specular = u_specular * spec * 0.4;
+    vec3  specular = u_specular * spec * 0.4;
 
-    fragColor = vec4(ambient + diffuse + specular, baseColor.a * u_globalAlpha);
+    fragColor = vec4(litColor + specular, alpha * u_globalAlpha);
 }
 )GLSL";
 
@@ -156,7 +169,11 @@ static std::string normalizePath(const std::string& p) {
 }
 
 static unsigned char* tryLoadTexture(const std::string& path, int* w, int* h, int* comp) {
-    stbi_set_flip_vertically_on_load(0);
+    // MMD/PMX uses DirectX UV convention: (0,0) = top-left.
+    // OpenGL UV convention: (0,0) = bottom-left.
+    // Flipping vertically on load corrects the mismatch so textures
+    // land on the correct body parts instead of being mirrored/shifted.
+    stbi_set_flip_vertically_on_load(1);
     unsigned char* data = stbi_load(path.c_str(), w, h, comp, STBI_rgb_alpha);
     return data;
 }
