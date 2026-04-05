@@ -65,21 +65,26 @@ private:
     float m_scale  = 1.f;
     float m_alpha  = 1.f;
 
-    // ── Rotation state (drag-to-rotate) ───────────────────────────────────
+    // ── Rotation state ────────────────────────────────────────────────────
     // m_rotX — pitch (vertical drag, rotation around X axis), clamped ±90°
     // m_rotY — yaw   (horizontal drag, rotation around Y axis), free
     float m_rotX = 0.f;
     float m_rotY = 0.f;
 
-    float m_lastTouchX   = 0.f;
-    float m_lastTouchY   = 0.f;
-    bool  m_isDragging   = false;
+    float m_lastTouchX = 0.f;
+    float m_lastTouchY = 0.f;
 
-    // Sensitivity: degrees per pixel → converted to radians on use
-    static constexpr float ROT_SENSITIVITY = 0.45f;
+    // Long-press gate: rotation is only enabled after the finger has been
+    // held still for LONG_PRESS_THRESHOLD seconds.
+    bool  m_touchHeld        = false;   // finger is currently down
+    float m_holdTimer        = 0.f;     // seconds elapsed since touch down
+    bool  m_rotationEnabled  = false;   // true after 1 s hold threshold
 
-    int   m_width  = 0;
-    int   m_height = 0;
+    static constexpr float LONG_PRESS_THRESHOLD = 1.0f;  // seconds
+    static constexpr float ROT_SENSITIVITY      = 0.45f; // degrees per pixel
 
-    bool  m_modelLoaded = false;
+    int  m_width  = 0;
+    int  m_height = 0;
+
+    bool m_modelLoaded = false;
 };

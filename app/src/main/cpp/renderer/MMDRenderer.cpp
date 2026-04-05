@@ -1,12 +1,15 @@
 /**
  * MMDRenderer.cpp — OpenGL ES 3.0 renderer for PMX/MMD models (Saba library).
  *
- * Saba API summary used here:
- *  - Vertices: GetPositions()/GetNormals()/GetUVs() + GetUpdate*() after animation
- *  - SubMeshes: GetSubMeshes() → m_beginIndex, m_vertexCount, m_materialID
- *  - MMDMaterial: m_diffuse(vec3), m_alpha(float), m_specular(vec3), m_ambient(vec3)
- *  - Morphs: GetMorphManager()->GetMorph(name)->SetWeight(w)
- *  - No unified MMDVertex struct; use 3 separate VBOs.
+ * Touch rotation:
+ *   Rotation is gated behind a 1-second long-press.  The user must hold the
+ *   finger still for ≥ LONG_PRESS_THRESHOLD seconds before dragging rotates
+ *   the model.  A tap (< threshold) is forwarded as a regular touch event
+ *   (headpat / interaction) by the Java layer.
+ *
+ * Brightness:
+ *   Toon band values and ambient are intentionally kept slightly below 1.0
+ *   to avoid the washed-out look on high-luminance AMOLED displays.
  */
 
 #include "MMDRenderer.h"
@@ -84,7 +87,10 @@ uniform float     u_globalAlpha;
 const vec3 LIGHT_DIR  = normalize(vec3(0.5, 1.0, 0.8));
 const vec3 LIGHT_COL  = vec3(1.0, 0.98, 0.95);
 const vec3 CAMERA_POS = vec3(0.0, 10.0, 40.0);
-const vec3 SCENE_AMB  = vec3(0.22, 0.18, 0.16);
+
+// Ambient slightly reduced so the model looks natural rather than washed-out.
+// Was vec3(0.22, 0.18, 0.16) — reduced by ~25 % across all channels.
+const vec3 SCENE_AMB  = vec3(0.16, 0.13, 0.11);
 
 void main() {
     vec3  albedo = u_diffuse.rgb;
@@ -103,18 +109,23 @@ void main() {
     vec3  N     = normalize(v_normal);
     float NdotL = max(dot(N, LIGHT_DIR), 0.0);
 
-    float toon = NdotL > 0.75 ? 0.78 : NdotL > 0.35 ? 0.58 : 0.38;
+    // Toon bands — slightly darker than before to avoid AMOLED overexposure.
+    // Previous values: 0.78 / 0.58 / 0.38
+    // New values:      0.68 / 0.50 / 0.32  (≈12 % reduction)
+    float toon = NdotL > 0.75 ? 0.68 : NdotL > 0.35 ? 0.50 : 0.32;
 
     vec3 ambientLight = max(u_ambient, SCENE_AMB);
     vec3 litColor = albedo * ambientLight + albedo * LIGHT_COL * toon;
 
     vec3  viewDir  = normalize(CAMERA_POS - v_worldPos);
     vec3  halfDir  = normalize(LIGHT_DIR + viewDir);
-    float spec     = pow(max(dot(N, halfDir), 0.0), 48.0) * (toon / 0.78);
-    vec3  specular = u_specular * spec * 0.3;
+    float spec     = pow(max(dot(N, halfDir), 0.0), 48.0) * (toon / 0.68);
+    vec3  specular = u_specular * spec * 0.25;
 
+    // Saturation boost reduced from 1.30 to 1.15 to keep colours vivid
+    // without amplifying the overall luminance.
     float lum  = dot(litColor, vec3(0.299, 0.587, 0.114));
-    litColor   = mix(vec3(lum), litColor, 1.30);
+    litColor   = mix(vec3(lum), litColor, 1.15);
 
     fragColor = vec4(litColor + specular, alpha * u_globalAlpha);
 }
@@ -164,8 +175,7 @@ static std::string normalizePath(const std::string& p) {
 
 static unsigned char* tryLoadTexture(const std::string& path, int* w, int* h, int* comp) {
     stbi_set_flip_vertically_on_load(1);
-    unsigned char* data = stbi_load(path.c_str(), w, h, comp, STBI_rgb_alpha);
-    return data;
+    return stbi_load(path.c_str(), w, h, comp, STBI_rgb_alpha);
 }
 
 // ─── Constructor / Destructor ─────────────────────────────────────────────────
@@ -247,10 +257,8 @@ bool MMDRenderer::loadPMXModel(const std::string& pmxPath) {
         const saba::MMDMaterial* mats = m_model->GetMaterials();
         size_t mc = m_model->GetMaterialCount();
         for (size_t i = 0; i < mc; ++i) {
-            if (mats[i].m_bothFace) {
-                LOGI("Material[%zu] bothFace=TRUE  tex=%s",
-                     i, mats[i].m_texture.c_str());
-            }
+            if (mats[i].m_bothFace)
+                LOGI("Material[%zu] bothFace=TRUE  tex=%s", i, mats[i].m_texture.c_str());
         }
     }
 
@@ -326,24 +334,18 @@ void MMDRenderer::loadTextures() {
     size_t matCount = m_model->GetMaterialCount();
     m_textures.assign(matCount, 0);
 
-    int loaded = 0, skipped = 0, failed = 0;
+    int loaded = 0, failed = 0;
     for (size_t i = 0; i < matCount; ++i) {
         const auto& mat = m_model->GetMaterials()[i];
-        if (mat.m_texture.empty()) { skipped++; continue; }
+        if (mat.m_texture.empty()) continue;
 
         std::string path = normalizePath(mat.m_texture);
-        if (path.empty() || path[0] != '/') {
-            path = m_modelDir + "/" + path;
-        }
+        if (path.empty() || path[0] != '/') path = m_modelDir + "/" + path;
         LOGI("Texture[%zu]: %s", i, path.c_str());
 
         int w = 0, h = 0, comp = 0;
         unsigned char* data = tryLoadTexture(path, &w, &h, &comp);
-        if (!data) {
-            LOGE("Tex FAILED[%zu]: %s", i, path.c_str());
-            failed++;
-            continue;
-        }
+        if (!data) { LOGE("Tex FAILED[%zu]: %s", i, path.c_str()); failed++; continue; }
 
         glGenTextures(1, &m_textures[i]);
         glBindTexture(GL_TEXTURE_2D, m_textures[i]);
@@ -367,17 +369,13 @@ void MMDRenderer::uploadVertices() {
 
     const glm::vec3* updPos  = m_model->GetUpdatePositions();
     const glm::vec3* updNorm = m_model->GetUpdateNormals();
-
     if (!updPos || !updNorm) return;
 
     size_t n = m_model->GetVertexCount();
-
     glBindBuffer(GL_ARRAY_BUFFER, m_vboPos);
     glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(n * sizeof(glm::vec3)), updPos);
-
     glBindBuffer(GL_ARRAY_BUFFER, m_vboNorm);
     glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(n * sizeof(glm::vec3)), updNorm);
-
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
@@ -389,22 +387,32 @@ void MMDRenderer::onSurfaceChanged(int w, int h) {
     LOGI("onSurfaceChanged %dx%d", w, h);
 }
 
-// ─── Touch — drag-to-rotate ───────────────────────────────────────────────────
+// ─── Touch / long-press rotation ─────────────────────────────────────────────
 //
-// The model rotates around Y (yaw) for horizontal drag and around X (pitch)
-// for vertical drag.  Sensitivity is ROT_SENSITIVITY degrees per pixel.
-// Pitch is clamped to ±90° so the model cannot flip upside-down.
-// All touch events arrive from the JNI queue (native-lib.cpp).
+// Rotation is only activated after the user holds the finger for
+// LONG_PRESS_THRESHOLD seconds without lifting.  The holdTimer is advanced
+// inside render() using the frame's deltaTime.
+//
+// Visual feedback idea (optional, Java-side):
+//   Show a small ring animation after 1 s to signal that rotation mode is active.
 
 void MMDRenderer::onTouchDown(float x, float y) {
-    m_lastTouchX = x;
-    m_lastTouchY = y;
-    m_isDragging = true;
-    LOGI("onTouchDown (%.1f, %.1f)", x, y);
+    m_lastTouchX     = x;
+    m_lastTouchY     = y;
+    m_touchHeld      = true;
+    m_holdTimer      = 0.f;
+    m_rotationEnabled = false;
+    LOGI("onTouchDown (%.1f, %.1f) — waiting for long-press", x, y);
 }
 
 void MMDRenderer::onTouchMove(float x, float y) {
-    if (!m_isDragging) return;
+    if (!m_rotationEnabled) {
+        // Before long-press fires: update last position so that the first
+        // drag after the threshold doesn't produce a huge rotation jump.
+        m_lastTouchX = x;
+        m_lastTouchY = y;
+        return;
+    }
 
     float dx = x - m_lastTouchX;
     float dy = y - m_lastTouchY;
@@ -415,13 +423,15 @@ void MMDRenderer::onTouchMove(float x, float y) {
     m_rotY += dx * RAD_PER_PX;
     m_rotX += dy * RAD_PER_PX;
 
-    // Clamp pitch to ±90°
+    // Clamp pitch to ±90° to prevent flipping
     constexpr float HALF_PI = glm::half_pi<float>();
     m_rotX = std::max(-HALF_PI, std::min(HALF_PI, m_rotX));
 }
 
 void MMDRenderer::onTouchUp() {
-    m_isDragging = false;
+    m_touchHeld       = false;
+    m_rotationEnabled = false;
+    m_holdTimer       = 0.f;
 }
 
 void MMDRenderer::setTransform(float x, float y, float scale, float alpha) {
@@ -437,7 +447,18 @@ void MMDRenderer::setMorphWeight(const std::string& name, float w) {
 
 // ─── Render ───────────────────────────────────────────────────────────────────
 
-void MMDRenderer::render(float /*dt*/) {
+void MMDRenderer::render(float dt) {
+    // ── Long-press timer ──────────────────────────────────────────────────
+    // Advance the hold timer while the finger is down and rotation hasn't
+    // fired yet.  Once the threshold is crossed, latch rotation on.
+    if (m_touchHeld && !m_rotationEnabled) {
+        m_holdTimer += dt;
+        if (m_holdTimer >= LONG_PRESS_THRESHOLD) {
+            m_rotationEnabled = true;
+            LOGI("Long-press threshold reached — rotation enabled");
+        }
+    }
+
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     if (!m_modelLoaded || !m_model) return;
 
@@ -451,9 +472,7 @@ void MMDRenderer::render(float /*dt*/) {
                                   glm::vec3(0.f, 10.f,  0.f),
                                   glm::vec3(0.f,  1.f,  0.f));
 
-    // ── Model matrix with drag-to-rotate ─────────────────────────────────
-    // Rotate around Y axis first (yaw/horizontal), then around X axis
-    // (pitch/vertical) so vertical drag tilts the already-yawed model.
+    // Model matrix with user-controlled rotation
     glm::mat4 model = glm::mat4(1.f);
     model = glm::rotate(model, m_rotY, glm::vec3(0.f, 1.f, 0.f));
     model = glm::rotate(model, m_rotX, glm::vec3(1.f, 0.f, 0.f));
@@ -499,12 +518,8 @@ void MMDRenderer::drawModel() {
         const saba::MMDSubMesh&  sm  = sms[i];
         const saba::MMDMaterial& mat = mats[sm.m_materialID];
 
-        if (mat.m_bothFace) {
-            glDisable(GL_CULL_FACE);
-        } else {
-            glEnable(GL_CULL_FACE);
-            glCullFace(GL_BACK);
-        }
+        if (mat.m_bothFace) glDisable(GL_CULL_FACE);
+        else { glEnable(GL_CULL_FACE); glCullFace(GL_BACK); }
 
         m_toonShader->setUniform4f("u_diffuse",
             mat.m_diffuse.r, mat.m_diffuse.g, mat.m_diffuse.b, mat.m_alpha);
@@ -543,7 +558,6 @@ void MMDRenderer::drawOutline(const glm::mat4& mvp) {
         const saba::MMDSubMesh&  sm  = sms[i];
         const saba::MMDMaterial& mat = mats[sm.m_materialID];
 
-        // Skip double-sided and non-edge materials.
         if (mat.m_bothFace || mat.m_edgeSize <= 0.0f) continue;
 
         glDrawElements(GL_TRIANGLES,
