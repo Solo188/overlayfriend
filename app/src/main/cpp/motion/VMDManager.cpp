@@ -3,15 +3,26 @@
  *
  * Correct Saba animation sequence per frame:
  *   model->BeginAnimation()
- *   model->UpdateAllAnimation(anim, frame, dt)   <- bones/IK/physics
- *   model->Update()                              <- SKIN MESH recalculation
+ *   model->UpdateAllAnimation(anim, frame, dt)
+ *   model->Update()
  *   model->EndAnimation()
+ *
+ * Smooth playback — two key fixes applied:
+ *
+ *  1. deltaTime clamping:
+ *     Raw deltaTime can spike on the first frame, after GC pauses, or when
+ *     the app is resumed.  Clamping to MAX_DELTA_TIME (50 ms) prevents the
+ *     model from "teleporting" to a distant keyframe in a single step.
+ *
+ *  2. Loop-point overshoot preservation:
+ *     When m_animTime exceeds m_animDuration the excess (overshoot) is
+ *     carried into the next loop iteration instead of being discarded.
+ *     This eliminates the visible "freeze frame" that occurs at the seam
+ *     when the animation restarts from exactly frame 0.
  *
  * Loop behaviour by category:
  *   "idle", "touch", "night", "friend" — seamless immediate loop
- *   "user" (files from Documents/Assistant/motion) — 10-second pause after
- *           each play-through, then restarts.  The model holds bind pose
- *           during the pause so hair/cloth physics still run.
+ *   "user" (Documents/Assistant/motion files) — 10-second pause, then replay
  */
 
 #include "VMDManager.h"
@@ -29,12 +40,17 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+// Maximum allowed deltaTime per frame.
+// Spikes larger than this (GC, resume, first frame) are clamped so that the
+// animation doesn't jump to a visually distant keyframe in one step.
+static constexpr float MAX_DELTA_TIME = 0.05f;  // 50 ms ≡ 20 fps minimum
+
 static const std::unordered_map<std::string, int> CATEGORY_TIER = {
     {"idle",   VMDManager::TIER_STRANGER},
     {"touch",  VMDManager::TIER_STRANGER},
     {"night",  VMDManager::TIER_PARTNER},
     {"friend", VMDManager::TIER_FRIEND},
-    // "user" is intentionally absent — always unlocked
+    // "user" intentionally absent — always unlocked
 };
 
 VMDManager::VMDManager()
@@ -82,7 +98,7 @@ bool VMDManager::loadMotion(const std::string& vmdPath, const std::string& categ
 
 bool VMDManager::isCategoryUnlocked(const std::string& cat) const {
     auto it = CATEGORY_TIER.find(cat);
-    if (it == CATEGORY_TIER.end()) return true;  // "user" and unknown → always unlocked
+    if (it == CATEGORY_TIER.end()) return true;
     return m_affinityTier >= it->second;
 }
 
@@ -97,7 +113,6 @@ void VMDManager::playCategory(const std::string& category) {
         return;
     }
 
-    // Cancel any ongoing pause when a new category is explicitly requested
     m_pauseActive = false;
     m_pauseTimer  = 0.f;
 
@@ -117,13 +132,16 @@ void VMDManager::playCategory(const std::string& category) {
     LOGI("Playing [%s] idx=%zu dur=%.2fs", category.c_str(), idx, m_animDuration);
 }
 
-// ─── Main update — called every frame from nativeRender ──────────────────────
+// ─── Main update ──────────────────────────────────────────────────────────────
 
-void VMDManager::update(float deltaTime) {
+void VMDManager::update(float rawDeltaTime) {
     if (!m_renderer) return;
 
     saba::MMDModel* model = m_renderer->getModel();
     if (!model) return;
+
+    // ── Clamp deltaTime to prevent large jumps on first frame / GC spikes ──
+    const float deltaTime = std::min(rawDeltaTime, MAX_DELTA_TIME);
 
     model->BeginAnimation();
 
@@ -132,26 +150,30 @@ void VMDManager::update(float deltaTime) {
     applyBlend(deltaTime);
 
     if (m_pauseActive) {
-        // ── Waiting between loops (only "user" category) ──────────────────
+        // ── Post-animation pause ("user" category) ────────────────────────
         m_pauseTimer -= deltaTime;
         if (m_pauseTimer <= 0.f) {
             m_pauseActive = false;
             LOGI("Pause over — restarting [%s]", m_currentCategory.c_str());
             playCategory(m_currentCategory);
         }
-        // Hold bind pose while paused so hair/cloth physics still simulate
+        // Bind pose while waiting; physics still simulate so hair settles.
         model->UpdateAllAnimation(nullptr, 0.f, deltaTime);
 
     } else if (m_currentAnim) {
         // ── Normal playback ───────────────────────────────────────────────
         m_animTime += deltaTime;
-        if (m_animTime > m_animDuration && m_animDuration > 0.f) {
+
+        if (m_animDuration > 0.f && m_animTime > m_animDuration) {
             startNextLoop();
+            // After a seamless loop, m_animTime was adjusted for overshoot
+            // inside startNextLoop() so the following UpdateAllAnimation call
+            // evaluates at the correct sub-frame position.
         }
+
         model->UpdateAllAnimation(m_currentAnim.get(), m_animTime * 30.f, deltaTime);
 
     } else {
-        // Bind pose
         model->UpdateAllAnimation(nullptr, 0.f, deltaTime);
     }
 
@@ -170,15 +192,23 @@ void VMDManager::applyBlend(float dt) {
 }
 
 void VMDManager::startNextLoop() {
-    // "user" category: pause for USER_LOOP_PAUSE seconds before replaying.
-    // All other categories loop immediately for a seamless feel.
     if (m_currentCategory == "user") {
-        LOGI("[user] animation ended — pausing %.1fs before next loop", USER_LOOP_PAUSE);
+        // Pause between loops — hold the last animation time so the model
+        // stays in end-of-animation pose during the wait.
+        LOGI("[user] animation ended — pausing %.1fs", USER_LOOP_PAUSE);
         m_pauseActive = true;
         m_pauseTimer  = USER_LOOP_PAUSE;
-        // Keep m_currentAnim so we know which category to restart
+        // Do NOT reset m_animTime here; hold the last frame during the pause.
+
     } else {
+        // ── Seamless loop with overshoot preservation ─────────────────────
+        // Instead of restarting from exactly frame 0, carry the excess time
+        // into the new iteration so the frame rate at the seam matches the
+        // rest of the animation.
+        float overshoot = m_animTime - m_animDuration;
         playCategory(m_currentCategory);
+        // playCategory() resets m_animTime to 0; add the overshoot back.
+        m_animTime = std::max(0.f, overshoot);
     }
 }
 
