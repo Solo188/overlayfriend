@@ -19,7 +19,6 @@ public:
     static constexpr int TIER_FRIEND   = 1;
     static constexpr int TIER_PARTNER  = 2;
 
-    // How long to pause between loops for the "user" category (seconds).
     static constexpr float USER_LOOP_PAUSE = 10.f;
 
     VMDManager();
@@ -29,8 +28,18 @@ public:
 
     bool loadMotion(const std::string& vmdPath, const std::string& category);
     void playCategory(const std::string& category);
-    void update(float deltaTime);
+
+    // Called every frame from nativeRender on the GL thread.
+    // rawDeltaTime: actual elapsed seconds (caller should NOT pre-clamp it —
+    // VMDManager applies its own clamping and smoothing internally).
+    void update(float rawDeltaTime);
+
     void setAffinityTier(int tier);
+
+    // Drag velocity in screen pixels/second, supplied by MMDRenderer.
+    // Used to tilt Bullet physics gravity so hair/clothes exhibit inertia
+    // proportional to how fast/sharply the model is being dragged.
+    void setDragVelocity(float vx, float vy);
 
 private:
     using Clock = std::chrono::steady_clock;
@@ -41,9 +50,9 @@ private:
     };
 
     struct BlendState {
-        float elapsed   = 0.f;
-        float duration  = 0.5f;
-        bool  active    = false;
+        float elapsed  = 0.f;
+        float duration = 0.5f;
+        bool  active   = false;
     };
 
     MMDRenderer* m_renderer = nullptr;
@@ -52,25 +61,31 @@ private:
 
     std::shared_ptr<saba::VMDAnimation> m_currentAnim;
     std::string                          m_currentCategory;
-    float                                m_animTime       = 0.f;
-    float                                m_animDuration   = 0.f;
+    float                                m_animTime     = 0.f;
+    float                                m_animDuration = 0.f;
 
     std::shared_ptr<saba::VMDAnimation> m_prevAnim;
-    float                                m_prevAnimTime   = 0.f;
+    float                                m_prevAnimTime = 0.f;
     BlendState                           m_blend;
 
-    // ── Post-animation pause (used by "user" category) ─────────────────────
-    // When an animation ends, m_pauseActive is set to true and m_pauseTimer
-    // counts down from USER_LOOP_PAUSE.  While paused the model holds bind pose.
     bool  m_pauseActive = false;
     float m_pauseTimer  = 0.f;
 
-    float  m_blinkTimer      = 0.f;
-    float  m_blinkInterval   = 3.5f;
-    float  m_blinkPhase      = 0.f;
-    bool   m_blinking        = false;
+    // Running average of physics deltaTime.
+    // Used only for the Bullet substep — keeps physics simulation smooth even
+    // when individual frames stutter.
+    float m_smoothedPhysDt = 0.016f;
 
-    float  m_mouthPhase      = 0.f;
+    // Drag velocity (pixels/second) from MMDRenderer
+    float m_dragVelX = 0.f;
+    float m_dragVelY = 0.f;
+
+    float m_blinkTimer    = 0.f;
+    float m_blinkInterval = 3.5f;
+    float m_blinkPhase    = 0.f;
+    bool  m_blinking      = false;
+
+    float m_mouthPhase = 0.f;
 
     std::mt19937 m_rng;
 
@@ -80,6 +95,7 @@ private:
     void tickMouth(float dt);
     void applyBlend(float dt);
     void startNextLoop();
+    void applyPhysicsInertia(void* model, float dt);
 
     bool isCategoryUnlocked(const std::string& category) const;
 };
