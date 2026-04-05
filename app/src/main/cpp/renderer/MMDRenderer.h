@@ -6,6 +6,8 @@
 
 #include <GLES3/gl3.h>
 
+#include <glm/glm.hpp>
+
 #include <Saba/Model/MMD/MMDModel.h>
 #include <Saba/Model/MMD/PMXModel.h>
 

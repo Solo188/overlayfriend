@@ -463,7 +463,9 @@ void MMDRenderer::render(float /*dt*/) {
     glm::mat4 model = glm::mat4(1.f);
     glm::mat4 mvp   = proj * view * model;
 
-    // Outline pass
+    // Outline pass — skip bothFace materials (hair, ribbons, thin quads).
+    // The front-face-cull outline technique creates dark artifacts on flat
+    // transparent geometry: the expanded shell bleeds onto neighbouring strands.
     glCullFace(GL_FRONT);
     glEnable(GL_CULL_FACE);
     m_outlineShader->use();
@@ -537,11 +539,28 @@ void MMDRenderer::drawModel() {
     glBindVertexArray(0);
 }
 
-void MMDRenderer::drawOutline() {
+void MMDRenderer::drawOutline(const glm::mat4& mvp) {
     if (!m_vao || !m_model) return;
+
+    const saba::MMDMaterial* mats  = m_model->GetMaterials();
+    const saba::MMDSubMesh*  sms   = m_model->GetSubMeshes();
+    size_t smCount = m_model->GetSubMeshCount();
+
     glBindVertexArray(m_vao);
-    glDrawElements(GL_TRIANGLES,
-                   (GLsizei)m_model->GetIndexCount(),
-                   GL_UNSIGNED_INT, nullptr);
+    for (size_t i = 0; i < smCount; ++i) {
+        const saba::MMDSubMesh&  sm  = sms[i];
+        const saba::MMDMaterial& mat = mats[sm.m_materialID];
+
+        // Skip double-sided and non-edge materials.
+        // bothFace geometry (hair, ribbons) creates dark bleed-through with
+        // the front-face-cull outline trick. Only draw outline on solid
+        // single-sided surfaces that have the edge flag set.
+        if (mat.m_bothFace || !mat.m_edge) continue;
+
+        glDrawElements(GL_TRIANGLES,
+                       (GLsizei)sm.m_vertexCount,
+                       GL_UNSIGNED_INT,
+                       (void*)((uintptr_t)sm.m_beginIndex * sizeof(uint32_t)));
+    }
     glBindVertexArray(0);
 }
