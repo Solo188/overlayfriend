@@ -27,10 +27,12 @@ public:
     void render(float deltaTime);
 
     void onTouchDown(float x, float y);
+    void onTouchMove(float x, float y);
+    void onTouchUp();
+
     void setTransform(float x, float y, float scale, float alpha);
     void setMorphWeight(const std::string& morphName, float weight);
 
-    // Returns the base MMDModel interface (used by VMDManager)
     saba::MMDModel* getModel() const { return m_model.get(); }
 
     int surfaceWidth()  const { return m_width; }
@@ -48,23 +50,33 @@ private:
     std::unique_ptr<ShaderProgram> m_toonShader;
     std::unique_ptr<ShaderProgram> m_outlineShader;
 
-    // Three separate VBOs: positions, normals, UVs  (Saba's vertex layout)
     GLuint m_vao     = 0;
-    GLuint m_vboPos  = 0;   // vec3 positions  (updated every frame via GetUpdatePositions)
-    GLuint m_vboNorm = 0;   // vec3 normals     (updated every frame via GetUpdateNormals)
-    GLuint m_vboUV   = 0;   // vec2 UVs         (static after load)
-    GLuint m_ibo     = 0;   // uint32 indices   (static after load)
+    GLuint m_vboPos  = 0;
+    GLuint m_vboNorm = 0;
+    GLuint m_vboUV   = 0;
+    GLuint m_ibo     = 0;
 
-    std::vector<GLuint> m_textures;   // one per material slot
+    std::vector<GLuint> m_textures;
 
-    // Directory containing the loaded PMX file — used to resolve relative
-    // texture paths stored inside the PMX material list.
     std::string m_modelDir;
 
     float m_posX   = 0.f;
     float m_posY   = 0.f;
     float m_scale  = 1.f;
     float m_alpha  = 1.f;
+
+    // ── Rotation state (drag-to-rotate) ───────────────────────────────────
+    // m_rotX — pitch (vertical drag, rotation around X axis), clamped ±90°
+    // m_rotY — yaw   (horizontal drag, rotation around Y axis), free
+    float m_rotX = 0.f;
+    float m_rotY = 0.f;
+
+    float m_lastTouchX   = 0.f;
+    float m_lastTouchY   = 0.f;
+    bool  m_isDragging   = false;
+
+    // Sensitivity: degrees per pixel → converted to radians on use
+    static constexpr float ROT_SENSITIVITY = 0.45f;
 
     int   m_width  = 0;
     int   m_height = 0;

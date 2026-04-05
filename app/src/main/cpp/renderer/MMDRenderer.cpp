@@ -21,9 +21,13 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
+#include <glm/gtc/constants.hpp>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
+
+#include <algorithm>
+#include <cmath>
 
 #define LOG_TAG "MMDRenderer"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -72,7 +76,7 @@ out vec4 fragColor;
 
 uniform sampler2D u_texDiffuse;
 uniform int       u_hasTexture;
-uniform vec4      u_diffuse;    // rgb = diffuse color, a = material alpha
+uniform vec4      u_diffuse;
 uniform vec3      u_specular;
 uniform vec3      u_ambient;
 uniform float     u_globalAlpha;
@@ -80,12 +84,9 @@ uniform float     u_globalAlpha;
 const vec3 LIGHT_DIR  = normalize(vec3(0.5, 1.0, 0.8));
 const vec3 LIGHT_COL  = vec3(1.0, 0.98, 0.95);
 const vec3 CAMERA_POS = vec3(0.0, 10.0, 40.0);
-// Warm ambient: slight red/pink bias helps saturated hair stay vivid in shadow.
-// total budget on bright face = 0.20 + 0.80 = 1.0 (no overexposure)
 const vec3 SCENE_AMB  = vec3(0.22, 0.18, 0.16);
 
 void main() {
-    // --- Albedo ---------------------------------------------------------
     vec3  albedo = u_diffuse.rgb;
     float alpha  = u_diffuse.a;
 
@@ -99,26 +100,19 @@ void main() {
 
     if (alpha * u_globalAlpha < 0.01) discard;
 
-    // --- Lighting -------------------------------------------------------
     vec3  N     = normalize(v_normal);
     float NdotL = max(dot(N, LIGHT_DIR), 0.0);
 
-    // Toon bands:
-    //   bright : 0.22 + 0.78 = 1.00
-    //   mid    : 0.22 + 0.58 = 0.80
-    //   shadow : 0.22 + 0.38 = 0.60  ← was 0.55, raised so pink hair stays pink
     float toon = NdotL > 0.75 ? 0.78 : NdotL > 0.35 ? 0.58 : 0.38;
 
     vec3 ambientLight = max(u_ambient, SCENE_AMB);
     vec3 litColor = albedo * ambientLight + albedo * LIGHT_COL * toon;
 
-    // Specular.
     vec3  viewDir  = normalize(CAMERA_POS - v_worldPos);
     vec3  halfDir  = normalize(LIGHT_DIR + viewDir);
     float spec     = pow(max(dot(N, halfDir), 0.0), 48.0) * (toon / 0.78);
     vec3  specular = u_specular * spec * 0.3;
 
-    // Saturation boost ×1.30
     float lum  = dot(litColor, vec3(0.299, 0.587, 0.114));
     litColor   = mix(vec3(lum), litColor, 1.30);
 
@@ -169,20 +163,13 @@ static std::string normalizePath(const std::string& p) {
 }
 
 static unsigned char* tryLoadTexture(const std::string& path, int* w, int* h, int* comp) {
-    // MMD/PMX uses DirectX UV convention: (0,0) = top-left.
-    // OpenGL UV convention: (0,0) = bottom-left.
-    // Flipping vertically on load corrects the mismatch so textures
-    // land on the correct body parts instead of being mirrored/shifted.
     stbi_set_flip_vertically_on_load(1);
     unsigned char* data = stbi_load(path.c_str(), w, h, comp, STBI_rgb_alpha);
     return data;
 }
 
-// ─── Constructor / Destructor ───────────────────────────────────────────────
-// These MUST be defined in the .cpp file because the class uses std::unique_ptr
-// with incomplete types (forward-declared in the header). The compiler needs to
-// know the full type at the point of destruction, which only the .cpp sees after
-// all headers are included.
+// ─── Constructor / Destructor ─────────────────────────────────────────────────
+
 MMDRenderer::MMDRenderer()  = default;
 MMDRenderer::~MMDRenderer() { shutdown(); }
 
@@ -246,7 +233,6 @@ bool MMDRenderer::loadPMXModel(const std::string& pmxPath) {
 
     m_model = std::make_unique<saba::PMXModel>();
     std::string dir = pmxPath.substr(0, pmxPath.find_last_of("/\\"));
-    // Store the model directory so loadTextures() can resolve relative paths.
     m_modelDir = dir;
 
     if (!m_model->Load(pmxPath, dir)) {
@@ -257,8 +243,6 @@ bool MMDRenderer::loadPMXModel(const std::string& pmxPath) {
     buildVAO();
     loadTextures();
 
-    // Diagnostic: log which materials have bothFace=true.
-    // This tells us if per-material culling is actually firing for hair.
     {
         const saba::MMDMaterial* mats = m_model->GetMaterials();
         size_t mc = m_model->GetMaterialCount();
@@ -291,18 +275,13 @@ void MMDRenderer::buildVAO() {
     glGenVertexArrays(1, &m_vao);
     glBindVertexArray(m_vao);
 
-    // Positions (dynamic — updated every frame via uploadVertices)
     glGenBuffers(1, &m_vboPos);
     glBindBuffer(GL_ARRAY_BUFFER, m_vboPos);
-    // Use GetPositions() (bind-pose) for the initial buffer allocation.
-    // GetUpdatePositions() is only valid after the first UpdateAllAnimation call.
-    // uploadVertices() overwrites this data with GetUpdatePositions() each frame.
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vCount * sizeof(glm::vec3)),
                  m_model->GetPositions(), GL_DYNAMIC_DRAW);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), nullptr);
 
-    // Normals (dynamic — updated every frame via uploadVertices)
     glGenBuffers(1, &m_vboNorm);
     glBindBuffer(GL_ARRAY_BUFFER, m_vboNorm);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vCount * sizeof(glm::vec3)),
@@ -310,7 +289,6 @@ void MMDRenderer::buildVAO() {
     glEnableVertexAttribArray(1);
     glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(glm::vec3), nullptr);
 
-    // UVs (static)
     glGenBuffers(1, &m_vboUV);
     glBindBuffer(GL_ARRAY_BUFFER, m_vboUV);
     glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vCount * sizeof(glm::vec2)),
@@ -318,7 +296,6 @@ void MMDRenderer::buildVAO() {
     glEnableVertexAttribArray(2);
     glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(glm::vec2), nullptr);
 
-    // Indices — expand to uint32 if needed
     glGenBuffers(1, &m_ibo);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_ibo);
     if (idxElemSize == 4) {
@@ -355,10 +332,6 @@ void MMDRenderer::loadTextures() {
         if (mat.m_texture.empty()) { skipped++; continue; }
 
         std::string path = normalizePath(mat.m_texture);
-
-        // FIX: Saba may store texture paths as relative (e.g. "tex/body.png").
-        // If the path is not absolute, prepend the model directory so that
-        // stbi_load() can find the file on the filesystem.
         if (path.empty() || path[0] != '/') {
             path = m_modelDir + "/" + path;
         }
@@ -395,16 +368,10 @@ void MMDRenderer::uploadVertices() {
     const glm::vec3* updPos  = m_model->GetUpdatePositions();
     const glm::vec3* updNorm = m_model->GetUpdateNormals();
 
-    // Guard: GetUpdate* return nullptr if UpdateAllAnimation has never been
-    // called.  Skip the GPU upload in that case — the bind-pose data
-    // uploaded in buildVAO() will be used until the first animation frame.
     if (!updPos || !updNorm) return;
 
     size_t n = m_model->GetVertexCount();
 
-    // FIX: Bind VBO explicitly before glBufferSubData.  The VAO stores
-    // attribute format pointers but NOT which ARRAY_BUFFER is currently
-    // bound — glBufferSubData operates on the bound ARRAY_BUFFER, not the VAO.
     glBindBuffer(GL_ARRAY_BUFFER, m_vboPos);
     glBufferSubData(GL_ARRAY_BUFFER, 0, (GLsizeiptr)(n * sizeof(glm::vec3)), updPos);
 
@@ -422,8 +389,39 @@ void MMDRenderer::onSurfaceChanged(int w, int h) {
     LOGI("onSurfaceChanged %dx%d", w, h);
 }
 
+// ─── Touch — drag-to-rotate ───────────────────────────────────────────────────
+//
+// The model rotates around Y (yaw) for horizontal drag and around X (pitch)
+// for vertical drag.  Sensitivity is ROT_SENSITIVITY degrees per pixel.
+// Pitch is clamped to ±90° so the model cannot flip upside-down.
+// All touch events arrive from the JNI queue (native-lib.cpp).
+
 void MMDRenderer::onTouchDown(float x, float y) {
+    m_lastTouchX = x;
+    m_lastTouchY = y;
+    m_isDragging = true;
     LOGI("onTouchDown (%.1f, %.1f)", x, y);
+}
+
+void MMDRenderer::onTouchMove(float x, float y) {
+    if (!m_isDragging) return;
+
+    float dx = x - m_lastTouchX;
+    float dy = y - m_lastTouchY;
+    m_lastTouchX = x;
+    m_lastTouchY = y;
+
+    constexpr float RAD_PER_PX = ROT_SENSITIVITY * (glm::pi<float>() / 180.f);
+    m_rotY += dx * RAD_PER_PX;
+    m_rotX += dy * RAD_PER_PX;
+
+    // Clamp pitch to ±90°
+    constexpr float HALF_PI = glm::half_pi<float>();
+    m_rotX = std::max(-HALF_PI, std::min(HALF_PI, m_rotX));
+}
+
+void MMDRenderer::onTouchUp() {
+    m_isDragging = false;
 }
 
 void MMDRenderer::setTransform(float x, float y, float scale, float alpha) {
@@ -443,16 +441,8 @@ void MMDRenderer::render(float /*dt*/) {
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     if (!m_modelLoaded || !m_model) return;
 
-    // NOTE: Animation update (BeginAnimation/UpdateAllAnimation/etc.) is driven
-    // by VMDManager::update() which is called from nativeRender() before this
-    // function.  We only need to upload the already-updated vertex data here.
     uploadVertices();
 
-    // Camera: MMD/Saba coordinate system.
-    // A typical PMX character is ~20 units tall (center of mass ~10 units up).
-    // eye at (0, 10, 40), looking at (0, 10, 0), FOV 45° frames the full body
-    // with a small margin in a 400×600 overlay window.
-    // near=0.1, far=500 covers the full Saba scene range.
     float aspect = (m_height > 0)
         ? static_cast<float>(m_width) / static_cast<float>(m_height)
         : 1.f;
@@ -460,12 +450,17 @@ void MMDRenderer::render(float /*dt*/) {
     glm::mat4 view  = glm::lookAt(glm::vec3(0.f, 10.f, 40.f),
                                   glm::vec3(0.f, 10.f,  0.f),
                                   glm::vec3(0.f,  1.f,  0.f));
-    glm::mat4 model = glm::mat4(1.f);
-    glm::mat4 mvp   = proj * view * model;
 
-    // Outline pass — skip bothFace materials (hair, ribbons, thin quads).
-    // The front-face-cull outline technique creates dark artifacts on flat
-    // transparent geometry: the expanded shell bleeds onto neighbouring strands.
+    // ── Model matrix with drag-to-rotate ─────────────────────────────────
+    // Rotate around Y axis first (yaw/horizontal), then around X axis
+    // (pitch/vertical) so vertical drag tilts the already-yawed model.
+    glm::mat4 model = glm::mat4(1.f);
+    model = glm::rotate(model, m_rotY, glm::vec3(0.f, 1.f, 0.f));
+    model = glm::rotate(model, m_rotX, glm::vec3(1.f, 0.f, 0.f));
+
+    glm::mat4 mvp = proj * view * model;
+
+    // Outline pass
     glCullFace(GL_FRONT);
     glEnable(GL_CULL_FACE);
     m_outlineShader->use();
@@ -504,9 +499,6 @@ void MMDRenderer::drawModel() {
         const saba::MMDSubMesh&  sm  = sms[i];
         const saba::MMDMaterial& mat = mats[sm.m_materialID];
 
-        // Per-material double-sided rendering.
-        // Hair, ribbons and similar materials have m_bothFace = true in the PMX.
-        // Rendering them with backface culling ON hides half the geometry (black holes).
         if (mat.m_bothFace) {
             glDisable(GL_CULL_FACE);
         } else {
@@ -552,9 +544,6 @@ void MMDRenderer::drawOutline(const glm::mat4& mvp) {
         const saba::MMDMaterial& mat = mats[sm.m_materialID];
 
         // Skip double-sided and non-edge materials.
-        // bothFace geometry (hair, ribbons) creates dark bleed-through with
-        // the front-face-cull outline trick. Only draw outline on solid
-        // single-sided surfaces that have the edge flag set.
         if (mat.m_bothFace || mat.m_edgeSize <= 0.0f) continue;
 
         glDrawElements(GL_TRIANGLES,
