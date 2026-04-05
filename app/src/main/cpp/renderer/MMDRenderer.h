@@ -41,7 +41,7 @@ private:
     void loadTextures();
     void uploadVertices();
     void drawModel();
-    void drawOutline();
+    void drawOutline(const glm::mat4& mvp);
 
     std::unique_ptr<saba::PMXModel> m_model;
 

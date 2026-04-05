@@ -475,7 +475,7 @@ void MMDRenderer::render(float /*dt*/) {
     m_outlineShader->setUniform1f  ("u_scale",          m_scale);
     m_outlineShader->setUniform4f  ("u_outlineColor",   0.05f, 0.05f, 0.05f, 1.f);
     m_outlineShader->setUniform1f  ("u_globalAlpha",    m_alpha);
-    drawOutline();
+    drawOutline(mvp);
 
     // Toon pass
     glCullFace(GL_BACK);
@@ -555,7 +555,7 @@ void MMDRenderer::drawOutline(const glm::mat4& mvp) {
         // bothFace geometry (hair, ribbons) creates dark bleed-through with
         // the front-face-cull outline trick. Only draw outline on solid
         // single-sided surfaces that have the edge flag set.
-        if (mat.m_bothFace || !mat.m_edge) continue;
+        if (mat.m_bothFace || mat.m_edgeSize <= 0.0f) continue;
 
         glDrawElements(GL_TRIANGLES,
                        (GLsizei)sm.m_vertexCount,
