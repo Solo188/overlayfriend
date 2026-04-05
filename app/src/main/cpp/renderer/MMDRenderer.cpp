@@ -80,14 +80,12 @@ uniform float     u_globalAlpha;
 const vec3 LIGHT_DIR  = normalize(vec3(0.5, 1.0, 0.8));
 const vec3 LIGHT_COL  = vec3(1.0, 0.98, 0.95);
 const vec3 CAMERA_POS = vec3(0.0, 10.0, 40.0);
-// Scene ambient: low so it doesn't wash out bright textures.
-// Total light budget = SCENE_AMB + LIGHT_COL*toon_max = 0.15 + 0.85 = 1.0
-const vec3 SCENE_AMB  = vec3(0.15, 0.15, 0.15);
+// Warm ambient: slight red/pink bias helps saturated hair stay vivid in shadow.
+// total budget on bright face = 0.20 + 0.80 = 1.0 (no overexposure)
+const vec3 SCENE_AMB  = vec3(0.22, 0.18, 0.16);
 
 void main() {
     // --- Albedo ---------------------------------------------------------
-    // Game-converted PMX: texture IS the color; diffuse/ambient = lighting
-    // coefficients only. Multiplying tex * diffuse_rgb caused washout.
     vec3  albedo = u_diffuse.rgb;
     float alpha  = u_diffuse.a;
 
@@ -105,27 +103,24 @@ void main() {
     vec3  N     = normalize(v_normal);
     float NdotL = max(dot(N, LIGHT_DIR), 0.0);
 
-    // Three toon bands. Values chosen so:
-    //   bright : SCENE_AMB(0.15) + LIGHT*0.85 = 1.00  (full saturation)
-    //   mid    : SCENE_AMB(0.15) + LIGHT*0.65 = 0.80  (slightly darker)
-    //   shadow : SCENE_AMB(0.15) + LIGHT*0.40 = 0.55  (clearly shaded, not black)
-    float toon = NdotL > 0.75 ? 0.85 : NdotL > 0.35 ? 0.65 : 0.40;
+    // Toon bands:
+    //   bright : 0.22 + 0.78 = 1.00
+    //   mid    : 0.22 + 0.58 = 0.80
+    //   shadow : 0.22 + 0.38 = 0.60  ← was 0.55, raised so pink hair stays pink
+    float toon = NdotL > 0.75 ? 0.78 : NdotL > 0.35 ? 0.58 : 0.38;
 
-    // Correct Phong ambient + diffuse (separate terms, no double-counting):
-    //   ambient component  = albedo * SCENE_AMB (fills shadow side)
-    //   diffuse component  = albedo * LIGHT_COL * toon
     vec3 ambientLight = max(u_ambient, SCENE_AMB);
     vec3 litColor = albedo * ambientLight + albedo * LIGHT_COL * toon;
 
-    // Specular — subtle, only on lit faces.
+    // Specular.
     vec3  viewDir  = normalize(CAMERA_POS - v_worldPos);
     vec3  halfDir  = normalize(LIGHT_DIR + viewDir);
-    float spec     = pow(max(dot(N, halfDir), 0.0), 48.0) * (toon / 0.85);
+    float spec     = pow(max(dot(N, halfDir), 0.0), 48.0) * (toon / 0.78);
     vec3  specular = u_specular * spec * 0.3;
 
-    // Saturation boost: push colours 15% further from grey.
+    // Saturation boost ×1.30
     float lum  = dot(litColor, vec3(0.299, 0.587, 0.114));
-    litColor   = mix(vec3(lum), litColor, 1.15);
+    litColor   = mix(vec3(lum), litColor, 1.30);
 
     fragColor = vec4(litColor + specular, alpha * u_globalAlpha);
 }
@@ -261,6 +256,19 @@ bool MMDRenderer::loadPMXModel(const std::string& pmxPath) {
 
     buildVAO();
     loadTextures();
+
+    // Diagnostic: log which materials have bothFace=true.
+    // This tells us if per-material culling is actually firing for hair.
+    {
+        const saba::MMDMaterial* mats = m_model->GetMaterials();
+        size_t mc = m_model->GetMaterialCount();
+        for (size_t i = 0; i < mc; ++i) {
+            if (mats[i].m_bothFace) {
+                LOGI("Material[%zu] bothFace=TRUE  tex=%s",
+                     i, mats[i].m_texture.c_str());
+            }
+        }
+    }
 
     m_modelLoaded = true;
     LOGI("PMX loaded: %s  verts=%zu  mats=%zu  subMeshes=%zu",
