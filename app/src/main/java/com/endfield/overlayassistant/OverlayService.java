@@ -8,9 +8,11 @@ import android.app.Service;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.PixelFormat;
+import android.os.FileObserver;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.util.Log;
 import android.view.WindowManager;
 
 import androidx.annotation.Nullable;
@@ -18,20 +20,28 @@ import androidx.core.app.NotificationCompat;
 
 import java.io.File;
 import java.util.Calendar;
+import java.util.HashSet;
+import java.util.Set;
 
 public class OverlayService extends Service {
 
+    private static final String TAG        = "OverlayService";
     private static final String CHANNEL_ID = "endfield_overlay";
     private static final int    NOTIF_ID   = 1001;
 
-    public static final String EXTRA_PMX_PATH       = "pmx_path";
-    public static final String EXTRA_CHAR_NAME      = "char_name";
+    public static final String EXTRA_PMX_PATH          = "pmx_path";
+    public static final String EXTRA_CHAR_NAME         = "char_name";
     public static final String ACTION_REFRESH_SETTINGS = "REFRESH_SETTINGS";
 
-    private static final String MOTIONS_BASE   = "/sdcard/Documents/Assistant/Models/";
-    private static final long   TICK_INTERVAL  = 60_000L;
+    private static final String MOTIONS_BASE  = "/sdcard/Documents/Assistant/Models/";
 
-    // Delay before loading motions — gives GL thread time to finish nativeLoadModel
+    /**
+     * Directory scanned for user-supplied VMD files.
+     * Drop any .vmd file here and the model will start playing it automatically.
+     */
+    private static final String USER_MOTION_DIR = "/sdcard/Documents/Assistant/motion/";
+
+    private static final long TICK_INTERVAL    = 60_000L;
     private static final long MOTIONS_LOAD_DELAY = 2_000L;
 
     private WindowManager   m_windowManager;
@@ -43,6 +53,12 @@ public class OverlayService extends Service {
     private Handler m_handler;
     private String  m_charName  = "DefaultChar";
     private boolean m_nightMode = false;
+
+    // ── User motion folder watcher ─────────────────────────────────────────
+    // Tracks which VMD paths have already been loaded so we don't re-load
+    // files that were already registered with the native engine.
+    private final Set<String> m_loadedUserVmds = new HashSet<>();
+    private FileObserver      m_motionObserver;
 
     private final Runnable m_tickRunnable = new Runnable() {
         @Override
@@ -68,7 +84,6 @@ public class OverlayService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null) {
-            // Settings changed — update scale/opacity on the overlay
             if (ACTION_REFRESH_SETTINGS.equals(intent.getAction())) {
                 if (m_overlayView != null) m_overlayView.applySettings();
                 return START_STICKY;
@@ -86,6 +101,7 @@ public class OverlayService extends Service {
     @Override
     public void onDestroy() {
         m_handler.removeCallbacksAndMessages(null);
+        stopMotionObserver();
         removeOverlayWindow();
         super.onDestroy();
     }
@@ -111,19 +127,20 @@ public class OverlayService extends Service {
         params.x = prefs.getInt("pos_x", 0);
         params.y = prefs.getInt("pos_y", 200);
 
-        // OverlayView constructor and addView must run on UI/main thread — OK here
-        // because onStartCommand is called on the main thread.
         m_overlayView = new OverlayView(this, m_nativeRenderer, m_affinity, m_ai, params);
         m_windowManager.addView(m_overlayView, params);
 
         if (pmxPath != null && !pmxPath.isEmpty()) {
-            // nativeLoadModel is queued to GL thread inside loadModel()
             m_overlayView.loadModel(pmxPath);
 
-            // Load motions after a delay to let nativeLoadModel finish on GL thread.
-            // 2 s is conservative but safe for a 5 MB model on mid-range devices.
             final String charName = m_charName;
-            m_handler.postDelayed(() -> loadMotionsForCharacter(charName), MOTIONS_LOAD_DELAY);
+            m_handler.postDelayed(() -> {
+                loadMotionsForCharacter(charName);
+                // Scan the user motion folder after character motions are loaded
+                scanUserMotionFolder();
+                // Start watching for new VMD files dropped into the folder
+                startMotionObserver();
+            }, MOTIONS_LOAD_DELAY);
         }
 
         m_handler.postDelayed(m_tickRunnable, TICK_INTERVAL);
@@ -137,7 +154,7 @@ public class OverlayService extends Service {
         }
     }
 
-    // ── Motion loading ─────────────────────────────────────────────────────
+    // ── Character motion loading ───────────────────────────────────────────
 
     private void loadMotionsForCharacter(String charName) {
         if (m_overlayView == null) return;
@@ -153,18 +170,90 @@ public class OverlayService extends Service {
             if (vmds == null) continue;
 
             for (File vmd : vmds) {
-                final String path = vmd.getAbsolutePath();
+                final String path     = vmd.getAbsolutePath();
                 final String category = cat;
-                // nativeLoadMotion must run on GL thread — it accesses MMDModel
                 m_overlayView.queueGLEvent(() ->
-                    m_nativeRenderer.nativeLoadMotion(path, category));
+                        m_nativeRenderer.nativeLoadMotion(path, category));
                 anyLoaded = true;
             }
         }
 
         if (anyLoaded) {
             m_overlayView.queueGLEvent(() ->
-                m_nativeRenderer.nativePlayMotionCategory("idle"));
+                    m_nativeRenderer.nativePlayMotionCategory("idle"));
+        }
+    }
+
+    // ── User VMD folder scanning ───────────────────────────────────────────
+
+    /**
+     * Scans USER_MOTION_DIR for .vmd files that haven't been loaded yet,
+     * registers each with the native engine as category "user", then
+     * triggers playback.  Safe to call multiple times — skips already-loaded files.
+     */
+    private void scanUserMotionFolder() {
+        if (m_overlayView == null) return;
+
+        File dir = new File(USER_MOTION_DIR);
+        if (!dir.exists()) {
+            // Create the folder so the user can easily find it
+            //noinspection ResultOfMethodCallIgnored
+            dir.mkdirs();
+        }
+        if (!dir.isDirectory()) return;
+
+        File[] vmds = dir.listFiles((d, n) -> n.toLowerCase().endsWith(".vmd"));
+        if (vmds == null || vmds.length == 0) return;
+
+        boolean anyNew = false;
+        for (File vmd : vmds) {
+            String absPath = vmd.getAbsolutePath();
+            if (m_loadedUserVmds.contains(absPath)) continue;
+
+            m_loadedUserVmds.add(absPath);
+            final String path = absPath;
+            Log.i(TAG, "Loading user VMD: " + path);
+            m_overlayView.queueGLEvent(() ->
+                    m_nativeRenderer.nativeLoadMotion(path, "user"));
+            anyNew = true;
+        }
+
+        if (anyNew) {
+            // Switch to playing user motions (they loop with 10 s pause in VMDManager)
+            m_overlayView.queueGLEvent(() ->
+                    m_nativeRenderer.nativePlayMotionCategory("user"));
+        }
+    }
+
+    // ── FileObserver — watch for new VMD files in real time ───────────────
+
+    private void startMotionObserver() {
+        stopMotionObserver();
+
+        File dir = new File(USER_MOTION_DIR);
+        if (!dir.exists()) dir.mkdirs();
+
+        // FileObserver fires on the calling thread pool; dispatch to main thread.
+        m_motionObserver = new FileObserver(USER_MOTION_DIR,
+                FileObserver.CREATE | FileObserver.MOVED_TO) {
+            @Override
+            public void onEvent(int event, @Nullable String path) {
+                if (path == null) return;
+                if (!path.toLowerCase().endsWith(".vmd")) return;
+
+                Log.i(TAG, "FileObserver: new VMD detected: " + path);
+                // Give the OS a moment to finish writing the file before reading it
+                m_handler.postDelayed(() -> scanUserMotionFolder(), 500);
+            }
+        };
+        m_motionObserver.startWatching();
+        Log.i(TAG, "Watching for VMD files in: " + USER_MOTION_DIR);
+    }
+
+    private void stopMotionObserver() {
+        if (m_motionObserver != null) {
+            m_motionObserver.stopWatching();
+            m_motionObserver = null;
         }
     }
 
