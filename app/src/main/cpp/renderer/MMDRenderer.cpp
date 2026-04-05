@@ -123,6 +123,10 @@ void main() {
     float spec     = pow(max(dot(N, halfDir), 0.0), 48.0) * (toon / 0.85);
     vec3  specular = u_specular * spec * 0.3;
 
+    // Saturation boost: push colours 15% further from grey.
+    float lum  = dot(litColor, vec3(0.299, 0.587, 0.114));
+    litColor   = mix(vec3(lum), litColor, 1.15);
+
     fragColor = vec4(litColor + specular, alpha * u_globalAlpha);
 }
 )GLSL";
@@ -489,6 +493,16 @@ void MMDRenderer::drawModel() {
     for (size_t i = 0; i < smCount; ++i) {
         const saba::MMDSubMesh&  sm  = sms[i];
         const saba::MMDMaterial& mat = mats[sm.m_materialID];
+
+        // Per-material double-sided rendering.
+        // Hair, ribbons and similar materials have m_bothFace = true in the PMX.
+        // Rendering them with backface culling ON hides half the geometry (black holes).
+        if (mat.m_bothFace) {
+            glDisable(GL_CULL_FACE);
+        } else {
+            glEnable(GL_CULL_FACE);
+            glCullFace(GL_BACK);
+        }
 
         m_toonShader->setUniform4f("u_diffuse",
             mat.m_diffuse.r, mat.m_diffuse.g, mat.m_diffuse.b, mat.m_alpha);
