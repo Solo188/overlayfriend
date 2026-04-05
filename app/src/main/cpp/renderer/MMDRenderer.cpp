@@ -79,26 +79,23 @@ uniform float     u_globalAlpha;
 
 const vec3 LIGHT_DIR  = normalize(vec3(0.5, 1.0, 0.8));
 const vec3 LIGHT_COL  = vec3(1.0, 0.98, 0.95);
-// Camera position must match the C++ side: eye at (0, 10, 40).
 const vec3 CAMERA_POS = vec3(0.0, 10.0, 40.0);
-// Minimum scene ambient so back-faces are never pure black.
-const vec3 SCENE_AMB  = vec3(0.3, 0.3, 0.3);
+// Scene ambient: low so it doesn't wash out bright textures.
+// Total light budget = SCENE_AMB + LIGHT_COL*toon_max = 0.15 + 0.85 = 1.0
+const vec3 SCENE_AMB  = vec3(0.15, 0.15, 0.15);
 
 void main() {
     // --- Albedo ---------------------------------------------------------
-    // For game-converted PMX (e.g. Arknights Endfield), the texture IS the
-    // color. Material diffuse/ambient are lighting coefficients, NOT tints.
-    // Multiplying tex * diffuse_rgb darkened everything to near-black because
-    // game models store diffuse ≈ (0.5, 0.5, 0.5).
-    vec3  albedo = u_diffuse.rgb;   // fallback: use material color
+    // Game-converted PMX: texture IS the color; diffuse/ambient = lighting
+    // coefficients only. Multiplying tex * diffuse_rgb caused washout.
+    vec3  albedo = u_diffuse.rgb;
     float alpha  = u_diffuse.a;
 
     if (u_hasTexture == 0) {
-        // No texture: keep material diffuse as color, force visible alpha.
         alpha = max(alpha, 1.0);
     } else {
         vec4 texColor = texture(u_texDiffuse, v_uv);
-        albedo = texColor.rgb;      // texture replaces diffuse rgb
+        albedo = texColor.rgb;
         alpha  = texColor.a * u_diffuse.a;
     }
 
@@ -107,20 +104,24 @@ void main() {
     // --- Lighting -------------------------------------------------------
     vec3  N     = normalize(v_normal);
     float NdotL = max(dot(N, LIGHT_DIR), 0.0);
-    // Toon bands. Shadow floor = 0.6 so back-faces stay visibly coloured.
-    float toon  = NdotL > 0.75 ? 1.0 : NdotL > 0.35 ? 0.78 : 0.6;
 
-    // Ambient: max of material ambient and scene minimum.
+    // Three toon bands. Values chosen so:
+    //   bright : SCENE_AMB(0.15) + LIGHT*0.85 = 1.00  (full saturation)
+    //   mid    : SCENE_AMB(0.15) + LIGHT*0.65 = 0.80  (slightly darker)
+    //   shadow : SCENE_AMB(0.15) + LIGHT*0.40 = 0.55  (clearly shaded, not black)
+    float toon = NdotL > 0.75 ? 0.85 : NdotL > 0.35 ? 0.65 : 0.40;
+
+    // Correct Phong ambient + diffuse (separate terms, no double-counting):
+    //   ambient component  = albedo * SCENE_AMB (fills shadow side)
+    //   diffuse component  = albedo * LIGHT_COL * toon
     vec3 ambientLight = max(u_ambient, SCENE_AMB);
+    vec3 litColor = albedo * ambientLight + albedo * LIGHT_COL * toon;
 
-    // Diffuse lighting applied to albedo.
-    vec3 litColor = albedo * (ambientLight + LIGHT_COL * toon);
-
-    // Specular highlight.
-    vec3  viewDir = normalize(CAMERA_POS - v_worldPos);
-    vec3  halfDir = normalize(LIGHT_DIR + viewDir);
-    float spec    = pow(max(dot(N, halfDir), 0.0), 32.0) * toon;
-    vec3  specular = u_specular * spec * 0.4;
+    // Specular — subtle, only on lit faces.
+    vec3  viewDir  = normalize(CAMERA_POS - v_worldPos);
+    vec3  halfDir  = normalize(LIGHT_DIR + viewDir);
+    float spec     = pow(max(dot(N, halfDir), 0.0), 48.0) * (toon / 0.85);
+    vec3  specular = u_specular * spec * 0.3;
 
     fragColor = vec4(litColor + specular, alpha * u_globalAlpha);
 }
