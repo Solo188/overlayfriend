@@ -7,8 +7,11 @@
  *   model->Update()                              <- SKIN MESH recalculation
  *   model->EndAnimation()
  *
- * Omitting Update() means GetUpdatePositions() returns stale/zero data
- * and the model is invisible (all vertices at origin = black screen).
+ * Loop behaviour by category:
+ *   "idle", "touch", "night", "friend" — seamless immediate loop
+ *   "user" (files from Documents/Assistant/motion) — 10-second pause after
+ *           each play-through, then restarts.  The model holds bind pose
+ *           during the pause so hair/cloth physics still run.
  */
 
 #include "VMDManager.h"
@@ -31,6 +34,7 @@ static const std::unordered_map<std::string, int> CATEGORY_TIER = {
     {"touch",  VMDManager::TIER_STRANGER},
     {"night",  VMDManager::TIER_PARTNER},
     {"friend", VMDManager::TIER_FRIEND},
+    // "user" is intentionally absent — always unlocked
 };
 
 VMDManager::VMDManager()
@@ -78,7 +82,7 @@ bool VMDManager::loadMotion(const std::string& vmdPath, const std::string& categ
 
 bool VMDManager::isCategoryUnlocked(const std::string& cat) const {
     auto it = CATEGORY_TIER.find(cat);
-    if (it == CATEGORY_TIER.end()) return true;
+    if (it == CATEGORY_TIER.end()) return true;  // "user" and unknown → always unlocked
     return m_affinityTier >= it->second;
 }
 
@@ -92,6 +96,11 @@ void VMDManager::playCategory(const std::string& category) {
         LOGI("No motions in category [%s]", category.c_str());
         return;
     }
+
+    // Cancel any ongoing pause when a new category is explicitly requested
+    m_pauseActive = false;
+    m_pauseTimer  = 0.f;
+
     auto& pool = it->second;
     std::uniform_int_distribution<size_t> pick(0, pool.size()-1);
     size_t idx = pick(m_rng);
@@ -116,31 +125,37 @@ void VMDManager::update(float deltaTime) {
     saba::MMDModel* model = m_renderer->getModel();
     if (!model) return;
 
-    // ── Step 1: BeginAnimation — resets morph/node deltas for this frame ─
     model->BeginAnimation();
 
-    // ── Step 2: Procedural morphs (blink, mouth) ─────────────────────────
     tickBlink(deltaTime);
     tickMouth(deltaTime);
     applyBlend(deltaTime);
 
-    // ── Step 3: UpdateAllAnimation — evaluates VMD keys, IK, physics ─────
-    if (m_currentAnim) {
+    if (m_pauseActive) {
+        // ── Waiting between loops (only "user" category) ──────────────────
+        m_pauseTimer -= deltaTime;
+        if (m_pauseTimer <= 0.f) {
+            m_pauseActive = false;
+            LOGI("Pause over — restarting [%s]", m_currentCategory.c_str());
+            playCategory(m_currentCategory);
+        }
+        // Hold bind pose while paused so hair/cloth physics still simulate
+        model->UpdateAllAnimation(nullptr, 0.f, deltaTime);
+
+    } else if (m_currentAnim) {
+        // ── Normal playback ───────────────────────────────────────────────
         m_animTime += deltaTime;
-        if (m_animTime > m_animDuration && m_animDuration > 0.f)
+        if (m_animTime > m_animDuration && m_animDuration > 0.f) {
             startNextLoop();
+        }
         model->UpdateAllAnimation(m_currentAnim.get(), m_animTime * 30.f, deltaTime);
+
     } else {
-        // Bind pose — still need to run physics for hair/cloth simulation
+        // Bind pose
         model->UpdateAllAnimation(nullptr, 0.f, deltaTime);
     }
 
-    // ── Step 4: Update — recalculates skin mesh into GetUpdatePositions() ─
-    // THIS IS THE CRITICAL CALL. Without it, GetUpdatePositions() returns
-    // stale/zero data and the model renders as an invisible point → BLACK SCREEN.
     model->Update();
-
-    // ── Step 5: EndAnimation — finalises node transforms ─────────────────
     model->EndAnimation();
 }
 
@@ -154,7 +169,18 @@ void VMDManager::applyBlend(float dt) {
     }
 }
 
-void VMDManager::startNextLoop() { playCategory(m_currentCategory); }
+void VMDManager::startNextLoop() {
+    // "user" category: pause for USER_LOOP_PAUSE seconds before replaying.
+    // All other categories loop immediately for a seamless feel.
+    if (m_currentCategory == "user") {
+        LOGI("[user] animation ended — pausing %.1fs before next loop", USER_LOOP_PAUSE);
+        m_pauseActive = true;
+        m_pauseTimer  = USER_LOOP_PAUSE;
+        // Keep m_currentAnim so we know which category to restart
+    } else {
+        playCategory(m_currentCategory);
+    }
+}
 
 void VMDManager::tickBlink(float dt) {
     if (!m_renderer) return;

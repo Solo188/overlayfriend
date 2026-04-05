@@ -19,6 +19,9 @@ public:
     static constexpr int TIER_FRIEND   = 1;
     static constexpr int TIER_PARTNER  = 2;
 
+    // How long to pause between loops for the "user" category (seconds).
+    static constexpr float USER_LOOP_PAUSE = 10.f;
+
     VMDManager();
     ~VMDManager();
 
@@ -33,7 +36,7 @@ private:
     using Clock = std::chrono::steady_clock;
 
     struct MotionEntry {
-        std::string                      path;
+        std::string                         path;
         std::shared_ptr<saba::VMDAnimation> anim;
     };
 
@@ -55,6 +58,12 @@ private:
     std::shared_ptr<saba::VMDAnimation> m_prevAnim;
     float                                m_prevAnimTime   = 0.f;
     BlendState                           m_blend;
+
+    // ── Post-animation pause (used by "user" category) ─────────────────────
+    // When an animation ends, m_pauseActive is set to true and m_pauseTimer
+    // counts down from USER_LOOP_PAUSE.  While paused the model holds bind pose.
+    bool  m_pauseActive = false;
+    float m_pauseTimer  = 0.f;
 
     float  m_blinkTimer      = 0.f;
     float  m_blinkInterval   = 3.5f;
