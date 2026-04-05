@@ -2,26 +2,20 @@
  * native-lib.cpp
  *
  * JNI bridge between Java (OverlayService / NativeRenderer) and the C++
- * rendering engine.  Every public symbol is a JNI-exported function named
- * Java_com_endfield_overlayassistant_NativeRenderer_<method>.
+ * rendering engine.
  *
- * Threading model:
- *   - All GL calls happen on the GL thread owned by NativeRenderer (Java side).
- *   - Touch / affinity callbacks arrive on the Android main thread; they are
- *     queued into an atomic ring buffer and consumed on the GL thread.
+ * Touch event types (MotionEvent.getAction()):
+ *   ACTION_DOWN = 0, ACTION_UP = 1, ACTION_MOVE = 2
  */
 
 #include <jni.h>
 #include <android/log.h>
-#include <android/asset_manager.h>
-#include <android/asset_manager_jni.h>
 #include <GLES3/gl3.h>
 #include <EGL/egl.h>
 
 #include <string>
 #include <memory>
 #include <atomic>
-#include <mutex>
 #include <chrono>
 
 #include "renderer/MMDRenderer.h"
@@ -33,6 +27,9 @@
 
 static std::unique_ptr<MMDRenderer> g_renderer;
 static std::unique_ptr<VMDManager>  g_vmdManager;
+
+// ─── Touch event queue (lock-free SPSC ring buffer) ──────────────────────────
+// type: 0=ACTION_DOWN, 1=ACTION_UP, 2=ACTION_MOVE
 
 struct TouchEvent { float x; float y; int type; };
 static constexpr size_t TOUCH_QUEUE_SIZE = 64;
@@ -139,13 +136,26 @@ Java_com_endfield_overlayassistant_NativeRenderer_nativeRender(
     double deltaTime = elapsed / 1000.0;
     g_lastFrame = now;
 
+    // ── Process queued touch events on the GL thread ──────────────────────
     size_t head = g_touchHead.load(std::memory_order_acquire);
     while (g_touchTail.load(std::memory_order_relaxed) != head) {
         size_t tail = g_touchTail.load(std::memory_order_relaxed);
         TouchEvent& ev = g_touchQueue[tail];
-        if (ev.type == 0) {
-            g_renderer->onTouchDown(ev.x, ev.y);
+
+        switch (ev.type) {
+            case 0: // ACTION_DOWN
+                g_renderer->onTouchDown(ev.x, ev.y);
+                break;
+            case 2: // ACTION_MOVE — drag-to-rotate
+                g_renderer->onTouchMove(ev.x, ev.y);
+                break;
+            case 1: // ACTION_UP
+                g_renderer->onTouchUp();
+                break;
+            default:
+                break;
         }
+
         g_touchTail.store((tail + 1) % TOUCH_QUEUE_SIZE, std::memory_order_release);
         head = g_touchHead.load(std::memory_order_acquire);
     }
@@ -167,6 +177,7 @@ JNIEXPORT void JNICALL
 Java_com_endfield_overlayassistant_NativeRenderer_nativeTouchEvent(
         JNIEnv* /*env*/, jobject /*thiz*/, jfloat x, jfloat y, jint action)
 {
+    // Enqueue all action types: DOWN(0), UP(1), MOVE(2)
     enqueueTouchEvent(x, y, action);
 }
 
