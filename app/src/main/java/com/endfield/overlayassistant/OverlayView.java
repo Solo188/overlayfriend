@@ -6,6 +6,7 @@ import android.graphics.PixelFormat;
 import android.opengl.GLSurfaceView;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.DisplayMetrics;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
 import android.view.View;
@@ -193,6 +194,32 @@ public class OverlayView extends FrameLayout {
         }
     }
 
+    // ── Screen bounds helper ───────────────────────────────────────────────
+    // Returns the usable screen rectangle [left, top, right, bottom] in pixels.
+    // The overlay window uses TYPE_APPLICATION_OVERLAY whose coordinate origin
+    // is the top-left corner of the *real* screen (including status bar).
+
+    private int[] getScreenBounds() {
+        DisplayMetrics dm = new DisplayMetrics();
+        if (m_wm != null) {
+            m_wm.getDefaultDisplay().getRealMetrics(dm);
+        }
+        return new int[]{ 0, 0, dm.widthPixels, dm.heightPixels };
+    }
+
+    /**
+     * Clamp a desired window position so the GL view stays fully on screen.
+     * Returns { clampedX, clampedY }.
+     */
+    private int[] clampToScreen(int desiredX, int desiredY) {
+        int[] screen = getScreenBounds();
+        int maxX = screen[2] - m_glPixW;
+        int maxY = screen[3] - m_glPixH;
+        int cx = Math.max(screen[0], Math.min(maxX, desiredX));
+        int cy = Math.max(screen[1], Math.min(maxY, desiredY));
+        return new int[]{ cx, cy };
+    }
+
     // ── Called by OverlayService when settings change ─────────────────────
     public void applySettings() {
         SharedPreferences prefs = getContext().getSharedPreferences(
@@ -264,8 +291,14 @@ public class OverlayView extends FrameLayout {
 
             case MotionEvent.ACTION_MOVE:
                 if (!m_positionLocked && event.getPointerCount() == 1) {
-                    m_params.x = m_initParamX + (int)(rawX - m_touchStartRawX);
-                    m_params.y = m_initParamY + (int)(rawY - m_touchStartRawY);
+                    int desiredX = m_initParamX + (int)(rawX - m_touchStartRawX);
+                    int desiredY = m_initParamY + (int)(rawY - m_touchStartRawY);
+
+                    // ── Clamp to screen bounds so the model never leaves its window ──
+                    int[] clamped = clampToScreen(desiredX, desiredY);
+                    m_params.x = clamped[0];
+                    m_params.y = clamped[1];
+
                     if (m_wm != null) {
                         try { m_wm.updateViewLayout(this, m_params); }
                         catch (Exception ignored) {}
