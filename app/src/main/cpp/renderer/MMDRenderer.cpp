@@ -420,15 +420,11 @@ void MMDRenderer::onTouchMove(float x, float y) {
     }
 
     if (m_mode == InteractMode::Dragging) {
-        // Translate pixel delta → NDC delta and apply to native drag offset.
-        // NDC runs –1..+1 over screenWidth/Height pixels, so:
-        //   dNDC_x =  dx * 2 / screenWidth
-        //   dNDC_y = -dy * 2 / screenHeight  (screen Y is flipped vs NDC)
-        if (m_width > 0 && m_height > 0) {
-            m_nativeDragX += dx *  2.f / static_cast<float>(m_width);
-            m_nativeDragY += dy * -2.f / static_cast<float>(m_height);
-        }
-        // Accumulate raw pixels for velocity computation in render()
+        // The overlay window is moved entirely by Java (OverlayView ACTION_MOVE),
+        // so we do NOT accumulate an NDC offset here — the model must stay fixed
+        // at the centre of its GL surface at all times.
+        // We still track raw pixel deltas so VMDManager can compute drag velocity
+        // for the physics-inertia / jiggle systems.
         m_accumDragPxX += dx;
         m_accumDragPxY += dy;
         return;
@@ -450,10 +446,13 @@ void MMDRenderer::onTouchUp() {
     if (m_mode == InteractMode::Rotating) {
         m_mode = InteractMode::None;
     }
-    // Dragging mode: keep offset so the model stays where it was placed.
-    // Reset accumulated drag pixels so velocity decays naturally.
+    // Dragging: the window has already been repositioned by Java.
+    // Reset accumulated drag pixels so velocity decays naturally after lift.
     m_accumDragPxX = 0.f;
     m_accumDragPxY = 0.f;
+    // Ensure native drag offset is always zero — model stays centred in window.
+    m_nativeDragX = 0.f;
+    m_nativeDragY = 0.f;
 }
 
 // ─── Render ───────────────────────────────────────────────────────────────────
@@ -513,9 +512,11 @@ void MMDRenderer::render(float dt) {
 
     glm::mat4 mvp = proj * view * model;
 
-    // Total screen offset = Java anchor + native drag
-    float totalOffsetX = m_posX + m_nativeDragX;
-    float totalOffsetY = m_posY + m_nativeDragY;
+    // Model is always centred in the GL surface (NDC 0,0).
+    // The overlay window is repositioned by Java when the user drags.
+    // m_nativeDragX/Y are kept at zero; m_posX/Y are also zero (set by Java).
+    float totalOffsetX = m_posX + m_nativeDragX;   // always 0
+    float totalOffsetY = m_posY + m_nativeDragY;   // always 0
 
     // Outline pass (front-face culled, slightly expanded)
     glCullFace(GL_FRONT);
