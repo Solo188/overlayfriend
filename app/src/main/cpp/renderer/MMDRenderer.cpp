@@ -176,6 +176,9 @@ void main() {
     // Subtle contrast micro-curve: lifts midtones, deepens darks
     litColor = litColor * (litColor * 0.10 + 0.95);
 
+    // Darken model by 15% to match desired appearance
+    litColor *= 0.85;
+
     fragColor = vec4(litColor, alpha * u_globalAlpha);
 }
 )GLSL";
