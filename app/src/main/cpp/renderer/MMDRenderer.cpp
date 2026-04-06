@@ -171,13 +171,13 @@ void main() {
 
     // Saturation boost — vivid colors like the reference render
     float lum  = dot(litColor, vec3(0.299, 0.587, 0.114));
-    litColor   = mix(vec3(lum), litColor, 1.22);
+    litColor   = mix(vec3(lum), litColor, 1.0);
 
     // Subtle contrast micro-curve: lifts midtones, deepens darks
     litColor = litColor * (litColor * 0.10 + 0.95);
 
     // Darken model by 15% to match desired appearance
-    litColor *= 0.60;
+    litColor *= 0.75;
 
     fragColor = vec4(litColor, alpha * u_globalAlpha);
 }
