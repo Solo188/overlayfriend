@@ -59,20 +59,24 @@ layout(location = 2) in vec2 a_uv;
 out vec3 v_normal;
 out vec2 v_uv;
 out vec3 v_worldPos;
+out vec3 v_viewNormal;   // view-space normal for sphere-map UV
 
 uniform mat4  u_mvp;
 uniform mat4  u_model;
+uniform mat4  u_view;
 uniform vec2  u_positionOffset;
 uniform float u_scale;
 
 void main() {
     vec4 worldPos = u_model * vec4(a_position, 1.0);
-    v_worldPos = worldPos.xyz;
-    v_normal   = normalize(mat3(transpose(inverse(u_model))) * a_normal);
-    v_uv       = a_uv;
+    v_worldPos  = worldPos.xyz;
+    v_normal    = normalize(mat3(transpose(inverse(u_model))) * a_normal);
+    v_uv        = a_uv;
+
+    // View-space normal: only the rotation part of the view matrix
+    v_viewNormal = normalize(mat3(u_view) * v_normal);
 
     vec4 clipPos  = u_mvp * vec4(a_position, 1.0);
-    // u_positionOffset is in NDC; multiply by w to convert back to clip space
     clipPos.x    += u_positionOffset.x * clipPos.w;
     clipPos.y    += u_positionOffset.y * clipPos.w;
     clipPos.xyz  *= u_scale;
@@ -86,6 +90,7 @@ precision highp float;
 in vec3 v_normal;
 in vec2 v_uv;
 in vec3 v_worldPos;
+in vec3 v_viewNormal;
 
 out vec4 fragColor;
 
@@ -96,11 +101,20 @@ uniform vec3      u_specular;
 uniform vec3      u_ambient;
 uniform float     u_globalAlpha;
 
-const vec3 LIGHT_DIR  = normalize(vec3(0.5, 1.0, 0.8));
-const vec3 LIGHT_COL  = vec3(1.0, 0.98, 0.95);
+// Sphere (matcap) map — adds the MMD characteristic sheen
+// u_spMode: 0 = off, 1 = multiply, 2 = add
+uniform sampler2D u_spTex;
+uniform int       u_spMode;
+
+// Key light: front-facing and slightly from upper-right, warm tone
+const vec3 LIGHT_DIR  = normalize(vec3(0.4, 1.0, 1.5));
+const vec3 LIGHT_COL  = vec3(1.0, 0.97, 0.93);
+// Fill light from opposite side — prevents pitch-black shadows
+const vec3 RIM_DIR    = normalize(vec3(-0.6, 0.3, -1.0));
+const vec3 RIM_COL    = vec3(0.18, 0.20, 0.28);
 const vec3 CAMERA_POS = vec3(0.0, 10.0, 40.0);
-// Slightly darker ambient — reduced ~25 % from the original 0.22/0.18/0.16
-const vec3 SCENE_AMB  = vec3(0.16, 0.13, 0.11);
+// Brighter ambient — shadow areas stay readable, not black
+const vec3 SCENE_AMB  = vec3(0.30, 0.27, 0.25);
 
 void main() {
     vec3  albedo = u_diffuse.rgb;
@@ -119,20 +133,48 @@ void main() {
     vec3  N     = normalize(v_normal);
     float NdotL = max(dot(N, LIGHT_DIR), 0.0);
 
-    // Toon bands at 68 / 50 / 32  (≈12 % darker than the original 78/58/38)
-    float toon = NdotL > 0.75 ? 0.68 : NdotL > 0.35 ? 0.50 : 0.32;
+    // Three-band cel-shading: bright / mid / shadow
+    float toon = NdotL > 0.65 ? 0.90 : NdotL > 0.25 ? 0.62 : 0.38;
+
+    // Fill light (rim)
+    float rimDot = max(dot(N, RIM_DIR), 0.0);
+    float rim    = rimDot > 0.5 ? 0.18 : 0.0;
 
     vec3 ambientLight = max(u_ambient, SCENE_AMB);
-    vec3 litColor = albedo * ambientLight + albedo * LIGHT_COL * toon;
+    vec3 litColor = albedo * ambientLight
+                  + albedo * LIGHT_COL * toon
+                  + albedo * RIM_COL   * rim;
 
+    // Specular highlight
     vec3  viewDir = normalize(CAMERA_POS - v_worldPos);
     vec3  halfDir = normalize(LIGHT_DIR + viewDir);
-    float spec    = pow(max(dot(N, halfDir), 0.0), 48.0) * (toon / 0.68);
-    litColor     += u_specular * spec * 0.25;
+    float spec    = pow(max(dot(N, halfDir), 0.0), 56.0) * (toon / 0.90);
+    litColor     += u_specular * spec * 0.45;
 
-    // Saturation boost 1.15 — vivid but not over-bright
+    // ── Sphere / matcap map ───────────────────────────────────────────────
+    // The view-space normal XY maps to UV on the sphere texture.
+    // This is the standard MMD sphere-map technique and provides most of
+    // the characteristic anime-model sheen that plain Phong lighting lacks.
+    if (u_spMode != 0) {
+        vec3  vn    = normalize(v_viewNormal);
+        vec2  spUV  = vn.xy * 0.5 + 0.5;
+        vec4  spCol = texture(u_spTex, spUV);
+
+        if (u_spMode == 1) {
+            // Multiply: tints the surface (typical for clothing sheen, hair gloss)
+            litColor *= spCol.rgb;
+        } else {
+            // Add: brightest highlights (eyes, metallic parts)
+            litColor += spCol.rgb * spCol.a;
+        }
+    }
+
+    // Saturation boost — vivid colors like the reference render
     float lum  = dot(litColor, vec3(0.299, 0.587, 0.114));
-    litColor   = mix(vec3(lum), litColor, 1.15);
+    litColor   = mix(vec3(lum), litColor, 1.22);
+
+    // Subtle contrast micro-curve: lifts midtones, deepens darks
+    litColor = litColor * (litColor * 0.10 + 0.95);
 
     fragColor = vec4(litColor, alpha * u_globalAlpha);
 }
@@ -212,8 +254,11 @@ bool MMDRenderer::initialize(int width, int height) {
 }
 
 void MMDRenderer::shutdown() {
-    for (GLuint t : m_textures) if (t) glDeleteTextures(1, &t);
+    for (GLuint t : m_textures)   if (t) glDeleteTextures(1, &t);
+    for (GLuint t : m_spTextures) if (t) glDeleteTextures(1, &t);
     m_textures.clear();
+    m_spTextures.clear();
+    m_spModes.clear();
     if (m_vboPos)  { glDeleteBuffers(1, &m_vboPos);   m_vboPos  = 0; }
     if (m_vboNorm) { glDeleteBuffers(1, &m_vboNorm);  m_vboNorm = 0; }
     if (m_vboUV)   { glDeleteBuffers(1, &m_vboUV);    m_vboUV   = 0; }
@@ -232,8 +277,11 @@ bool MMDRenderer::loadPMXModel(const std::string& pmxPath) {
     LOGI("loadPMXModel: %s", pmxPath.c_str());
 
     if (m_modelLoaded) {
-        for (GLuint t : m_textures) glDeleteTextures(1, &t);
+        for (GLuint t : m_textures)   glDeleteTextures(1, &t);
+        for (GLuint t : m_spTextures) glDeleteTextures(1, &t);
         m_textures.clear();
+        m_spTextures.clear();
+        m_spModes.clear();
         if (m_vboPos)  { glDeleteBuffers(1, &m_vboPos);   m_vboPos  = 0; }
         if (m_vboNorm) { glDeleteBuffers(1, &m_vboNorm);  m_vboNorm = 0; }
         if (m_vboUV)   { glDeleteBuffers(1, &m_vboUV);    m_vboUV   = 0; }
@@ -348,10 +396,71 @@ void MMDRenderer::loadTextures() {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
         glGenerateMipmap(GL_TEXTURE_2D);
+        // Anisotropic filtering — sharpens textures at oblique angles (hair, clothes).
+        // Use GL_TEXTURE_MAX_ANISOTROPY_EXT if the device supports it.
+        {
+            float maxAniso = 1.f;
+            glGetFloatv(0x84FF /*GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT*/, &maxAniso);
+            if (maxAniso > 1.f) {
+                float aniso = (maxAniso > 8.f) ? 8.f : maxAniso;
+                glTexParameterf(GL_TEXTURE_2D,
+                                0x84FE /*GL_TEXTURE_MAX_ANISOTROPY_EXT*/, aniso);
+            }
+        }
         stbi_image_free(data);
         loaded++;
     }
     LOGI("Textures: %d loaded, %d failed out of %zu materials", loaded, failed, matCount);
+
+    // ── Sphere-map (sp) textures ──────────────────────────────────────────
+    // These give the characteristic MMD model sheen: hair gloss, clothing
+    // highlights, metallic reflections.  Missing = no effect (mode 0).
+    m_spTextures.assign(matCount, 0);
+    m_spModes.assign(matCount, 0);
+    int spLoaded = 0;
+
+    // Helper: load one texture, return GL id (0 on failure).
+    auto loadTex = [&](const std::string& rawPath) -> GLuint {
+        std::string p = normalizePath(rawPath);
+        if (p.empty()) return 0;
+        if (p[0] != '/') p = m_modelDir + "/" + p;
+        int w2, h2, c2;
+        unsigned char* d = stbi_load(p.c_str(), &w2, &h2, &c2, STBI_rgb_alpha);
+        if (!d) return 0;
+        GLuint tid = 0;
+        glGenTextures(1, &tid);
+        glBindTexture(GL_TEXTURE_2D, tid);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w2, h2, 0, GL_RGBA, GL_UNSIGNED_BYTE, d);
+        glGenerateMipmap(GL_TEXTURE_2D);
+        stbi_image_free(d);
+        return tid;
+    };
+
+    for (size_t i = 0; i < matCount; ++i) {
+        const auto& mat = m_model->GetMaterials()[i];
+        if (mat.m_spTexture.empty()) continue;
+
+        // MMD sphere mode: None=0, Mul=1, Add=2
+        int mode = 0;
+        switch (mat.m_spTextureMode) {
+            case saba::MMDMaterial::SphereTextureMode::Mul: mode = 1; break;
+            case saba::MMDMaterial::SphereTextureMode::Add: mode = 2; break;
+            default: break;
+        }
+        if (mode == 0) continue;
+
+        GLuint tid = loadTex(mat.m_spTexture);
+        if (tid) {
+            m_spTextures[i] = tid;
+            m_spModes[i]    = mode;
+            spLoaded++;
+        }
+    }
+    LOGI("Sphere textures: %d loaded out of %zu materials", spLoaded, matCount);
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
@@ -535,6 +644,7 @@ void MMDRenderer::render(float dt) {
     m_toonShader->use();
     m_toonShader->setUniformMat4("u_mvp",            glm::value_ptr(mvp));
     m_toonShader->setUniformMat4("u_model",          glm::value_ptr(model));
+    m_toonShader->setUniformMat4("u_view",           glm::value_ptr(view));
     m_toonShader->setUniform2f  ("u_positionOffset", totalOffsetX, totalOffsetY);
     m_toonShader->setUniform1f  ("u_scale",          m_scale);
     m_toonShader->setUniform1f  ("u_globalAlpha",    m_alpha);
@@ -568,20 +678,34 @@ void MMDRenderer::drawModel() {
             mat.m_ambient.r, mat.m_ambient.g, mat.m_ambient.b);
 
         size_t matIdx = static_cast<size_t>(sm.m_materialID);
-        GLuint texId  = (matIdx < m_textures.size()) ? m_textures[matIdx] : 0;
-        bool hasTex   = (texId != 0);
+
+        // ── Diffuse texture (unit 0) ──────────────────────────────────────
+        GLuint texId = (matIdx < m_textures.size()) ? m_textures[matIdx] : 0;
+        bool hasTex  = (texId != 0);
         m_toonShader->setUniform1i("u_hasTexture", hasTex ? 1 : 0);
-        if (hasTex) {
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, texId);
-            m_toonShader->setUniform1i("u_texDiffuse", 0);
-        }
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, hasTex ? texId : 0);
+        m_toonShader->setUniform1i("u_texDiffuse", 0);
+
+        // ── Sphere-map texture (unit 1) ───────────────────────────────────
+        GLuint spId   = (matIdx < m_spTextures.size()) ? m_spTextures[matIdx] : 0;
+        int    spMode = (matIdx < m_spModes.size())    ? m_spModes[matIdx]    : 0;
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, spId ? spId : 0);
+        m_toonShader->setUniform1i("u_spTex",  1);
+        m_toonShader->setUniform1i("u_spMode", spId ? spMode : 0);
 
         glDrawElements(GL_TRIANGLES,
                        (GLsizei)sm.m_vertexCount,
                        GL_UNSIGNED_INT,
                        (void*)((uintptr_t)sm.m_beginIndex * sizeof(uint32_t)));
     }
+
+    // Restore texture units to a clean state
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, 0);
     glBindVertexArray(0);
 }
 

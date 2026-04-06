@@ -72,6 +72,11 @@ private:
     GLuint m_ibo     = 0;
 
     std::vector<GLuint> m_textures;
+    // Sphere-map textures (one per material, 0 = not present).
+    // MMD sphere maps add the characteristic model sheen.
+    // Mode per material: 0 = off, 1 = multiply, 2 = add.
+    std::vector<GLuint> m_spTextures;
+    std::vector<int>    m_spModes;
     std::string m_modelDir;
 
     // ── Position / scale / alpha set by Java ─────────────────────────────
