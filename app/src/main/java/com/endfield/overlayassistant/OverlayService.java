@@ -13,6 +13,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.util.Log;
+import android.view.Gravity;
 import android.view.WindowManager;
 
 import androidx.annotation.Nullable;
@@ -122,6 +123,11 @@ public class OverlayService extends Service {
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
                         | WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
                 PixelFormat.TRANSLUCENT);
+
+        // Use TOP|LEFT gravity so that params.x/y are screen-relative pixel offsets
+        // from the top-left corner.  Without this Android defaults to Gravity.CENTER,
+        // which makes (0,0) the screen centre and breaks boundary clamping.
+        params.gravity = Gravity.TOP | Gravity.LEFT;
 
         SharedPreferences prefs = getSharedPreferences("overlay_state", MODE_PRIVATE);
         params.x = prefs.getInt("pos_x", 0);
