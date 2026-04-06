@@ -177,7 +177,7 @@ void main() {
     litColor = litColor * (litColor * 0.10 + 0.95);
 
     // Darken model by 15% to match desired appearance
-    litColor *= 0.85;
+    litColor *= 0.60;
 
     fragColor = vec4(litColor, alpha * u_globalAlpha);
 }
