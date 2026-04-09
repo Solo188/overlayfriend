@@ -24,6 +24,15 @@
  * every JNI call that touches GL or native objects.  This prevents
  * use-after-free when the GL thread processes queued events after the EGL
  * context has been torn down.
+ *
+ * Drag velocity / jiggle physics
+ * ──────────────────────────────
+ * When the overlay window is dragged, Java measures screen-space velocity
+ * (rawX/Y delta / dt) and stores it in g_dragVelX/Y via nativeSetDragVelocity.
+ * Each frame nativeRender forwards these values to VMDManager, which:
+ *   1. Tilts Bullet gravity laterally (hair/cloth inertia, proportional to speed)
+ *   2. Fires an impulse on heavy rigid bodies (breast/hip) on sudden stops/jerks
+ * On ACTION_UP Java sets velocity to (0,0) so Bullet damps out naturally.
  */
 
 #include <jni.h>
@@ -50,6 +59,16 @@ static std::unique_ptr<VMDManager>  g_vmdManager;
 // This prevents use-after-free on the GL thread when the EGL surface is
 // torn down before queued events have been drained.
 static std::atomic<bool> g_destroyed{false};
+
+// ─── Drag velocity (set from Java, consumed by VMDManager each frame) ─────────
+//
+// Using relaxed atomics: the GL thread reads these once per frame and the UI
+// thread writes them on every ACTION_MOVE.  A single-frame lag is acceptable
+// for physics — the cost of a full memory barrier on every finger movement is
+// not worth it.
+//
+static std::atomic<float> g_dragVelX{0.f};
+static std::atomic<float> g_dragVelY{0.f};
 
 // ─── Touch event queue (lock-free SPSC ring buffer) ──────────────────────────
 // type: 0=ACTION_DOWN, 1=ACTION_UP, 2=ACTION_MOVE
@@ -166,6 +185,25 @@ Java_com_endfield_overlayassistant_NativeRenderer_nativeOnTouch(
     g_vmdManager->onTouch();
 }
 
+/**
+ * nativeSetDragVelocity — called from Java's ACTION_MOVE handler.
+ *
+ * Java computes velocity = (rawPos - prevRawPos) / deltaTime for each pointer
+ * move event and passes it here.  The values are stored in relaxed atomics and
+ * consumed by nativeRender once per frame.
+ *
+ * On ACTION_UP Java calls this with (0, 0) to signal "drag stopped" so Bullet
+ * can damp the jiggle back to rest naturally.
+ */
+extern "C" JNIEXPORT void JNICALL
+Java_com_endfield_overlayassistant_NativeRenderer_nativeSetDragVelocity(
+        JNIEnv* /*env*/, jobject /*thiz*/, jfloat vx, jfloat vy)
+{
+    if (g_destroyed.load(std::memory_order_acquire)) return;
+    g_dragVelX.store(vx, std::memory_order_relaxed);
+    g_dragVelY.store(vy, std::memory_order_relaxed);
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_endfield_overlayassistant_NativeRenderer_nativeRender(
         JNIEnv* /*env*/, jobject /*thiz*/)
@@ -198,10 +236,15 @@ Java_com_endfield_overlayassistant_NativeRenderer_nativeRender(
         head = g_touchHead.load(std::memory_order_acquire);
     }
 
-    // Pass drag velocity to VMDManager for physics inertia / jiggle.
-    if (g_vmdManager && g_renderer) {
-        g_vmdManager->setDragVelocity(g_renderer->getDragVelX(),
-                                      g_renderer->getDragVelY());
+    // ── Forward drag velocity to physics ─────────────────────────────────
+    //
+    // Java measures window-level drag (the overlay moves across the screen),
+    // which is invisible to GL touch coordinates.  Use the Java-provided value
+    // rather than the renderer's internal touch tracking.
+    if (g_vmdManager) {
+        g_vmdManager->setDragVelocity(
+            g_dragVelX.load(std::memory_order_relaxed),
+            g_dragVelY.load(std::memory_order_relaxed));
     }
 
     if (g_vmdManager) g_vmdManager->update(dt);
@@ -265,6 +308,10 @@ Java_com_endfield_overlayassistant_NativeRenderer_nativeDestroy(
 
     // Signal all other JNI calls to bail out immediately.
     g_destroyed.store(true, std::memory_order_release);
+
+    // Reset velocity so stale values don't leak into the next session.
+    g_dragVelX.store(0.f, std::memory_order_relaxed);
+    g_dragVelY.store(0.f, std::memory_order_relaxed);
 
     if (g_vmdManager) g_vmdManager.reset();
     if (g_renderer)   { g_renderer->shutdown(); g_renderer.reset(); }
