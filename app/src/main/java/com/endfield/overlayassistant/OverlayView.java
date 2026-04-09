@@ -14,6 +14,9 @@ import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.TextView;
 
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
 
@@ -47,11 +50,9 @@ public class OverlayView extends FrameLayout {
     private static final float SCALE_MAX = 3.0f;
 
     // ── GL surface size ───────────────────────────────────────────────────
-    // Base size that matches the native renderer's aspect ratio (400:600 = 2:3)
     private static final int GL_W_BASE = 400;
     private static final int GL_H_BASE = 600;
 
-    // Current physical pixel size of the GL view (changes with scale)
     private int m_glPixW = GL_W_BASE;
     private int m_glPixH = GL_H_BASE;
 
@@ -71,12 +72,10 @@ public class OverlayView extends FrameLayout {
         m_params   = params;
         m_wm       = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
 
-        // Load saved scale from settings
         SharedPreferences prefs = context.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE);
         m_currentScale = prefs.getFloat(KEY_SCALE, 1.0f);
         float opacity  = prefs.getFloat(KEY_OPACITY, 1.0f);
 
-        // Init pinch detector
         m_scaleDetector = new ScaleGestureDetector(context,
                 new ScaleGestureDetector.SimpleOnScaleGestureListener() {
                     @Override
@@ -90,7 +89,6 @@ public class OverlayView extends FrameLayout {
 
         buildLayout(context);
 
-        // Apply initial scale and opacity
         m_glPixW = (int)(GL_W_BASE * m_currentScale);
         m_glPixH = (int)(GL_H_BASE * m_currentScale);
         updateGLViewSize();
@@ -118,7 +116,6 @@ public class OverlayView extends FrameLayout {
                         m_pendingPmxPath = null;
                         m_renderer.nativeLoadModel(pending);
                     }
-                    // Apply saved opacity
                     SharedPreferences prefs = context.getSharedPreferences(
                             PREFS_SETTINGS, Context.MODE_PRIVATE);
                     float opacity = prefs.getFloat(KEY_OPACITY, 1.0f);
@@ -152,7 +149,6 @@ public class OverlayView extends FrameLayout {
         m_glView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
         addView(m_glView, new FrameLayout.LayoutParams(m_glPixW, m_glPixH));
 
-        // Speech bubble
         m_bubble = new TextView(context);
         m_bubble.setTextSize(14f);
         m_bubble.setTextColor(0xFFFFFFFF);
@@ -172,8 +168,6 @@ public class OverlayView extends FrameLayout {
         m_glPixW = (int)(GL_W_BASE * m_currentScale);
         m_glPixH = (int)(GL_H_BASE * m_currentScale);
         m_uiHandler.post(this::updateGLViewSize);
-
-        // Save scale so Settings shows correct value
         getContext().getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE)
                 .edit().putFloat(KEY_SCALE, m_currentScale).apply();
     }
@@ -185,8 +179,6 @@ public class OverlayView extends FrameLayout {
         lp.width  = m_glPixW;
         lp.height = m_glPixH;
         m_glView.setLayoutParams(lp);
-
-        // Also resize the overlay window itself
         m_params.width  = m_glPixW;
         m_params.height = m_glPixH;
         if (m_wm != null) {
@@ -195,9 +187,6 @@ public class OverlayView extends FrameLayout {
     }
 
     // ── Screen bounds helper ───────────────────────────────────────────────
-    // Returns the usable screen rectangle [left, top, right, bottom] in pixels.
-    // The overlay window uses TYPE_APPLICATION_OVERLAY whose coordinate origin
-    // is the top-left corner of the *real* screen (including status bar).
 
     private int[] getScreenBounds() {
         DisplayMetrics dm = new DisplayMetrics();
@@ -207,10 +196,6 @@ public class OverlayView extends FrameLayout {
         return new int[]{ 0, 0, dm.widthPixels, dm.heightPixels };
     }
 
-    /**
-     * Clamp a desired window position so the GL view stays fully on screen.
-     * Returns { clampedX, clampedY }.
-     */
     private int[] clampToScreen(int desiredX, int desiredY) {
         int[] screen = getScreenBounds();
         int maxX = screen[2] - m_glPixW;
@@ -220,7 +205,8 @@ public class OverlayView extends FrameLayout {
         return new int[]{ cx, cy };
     }
 
-    // ── Called by OverlayService when settings change ─────────────────────
+    // ── Settings ──────────────────────────────────────────────────────────
+
     public void applySettings() {
         SharedPreferences prefs = getContext().getSharedPreferences(
                 PREFS_SETTINGS, Context.MODE_PRIVATE);
@@ -265,19 +251,16 @@ public class OverlayView extends FrameLayout {
 
     @Override
     public boolean onTouchEvent(MotionEvent event) {
-        // Always pass to scale detector first
         m_scaleDetector.onTouchEvent(event);
-
-        // If scaling — don't drag or headpat
         if (m_scaleDetector.isInProgress()) return true;
 
         float rawX = event.getRawX();
         float rawY = event.getRawY();
 
         if (m_glReady) {
-            final float lx = event.getX();
-            final float ly = event.getY();
-            final int act  = event.getAction();
+            final float lx  = event.getX();
+            final float ly  = event.getY();
+            final int   act = event.getAction();
             m_glView.queueEvent(() -> m_renderer.nativeTouchEvent(lx, ly, act));
         }
 
@@ -293,12 +276,9 @@ public class OverlayView extends FrameLayout {
                 if (!m_positionLocked && event.getPointerCount() == 1) {
                     int desiredX = m_initParamX + (int)(rawX - m_touchStartRawX);
                     int desiredY = m_initParamY + (int)(rawY - m_touchStartRawY);
-
-                    // ── Clamp to screen bounds so the model never leaves its window ──
                     int[] clamped = clampToScreen(desiredX, desiredY);
                     m_params.x = clamped[0];
                     m_params.y = clamped[1];
-
                     if (m_wm != null) {
                         try { m_wm.updateViewLayout(this, m_params); }
                         catch (Exception ignored) {}
@@ -319,8 +299,11 @@ public class OverlayView extends FrameLayout {
 
     private void onHeadpat() {
         m_affinity.onHeadpat();
-        if (m_glReady)
-            m_glView.queueEvent(() -> m_renderer.nativePlayMotionCategory("touch"));
+        if (m_glReady) {
+            // Use the priority-interrupt touch path so it overrides any
+            // currently playing waiting / dance animation immediately.
+            m_glView.queueEvent(() -> m_renderer.nativeOnTouch());
+        }
         showBubble(m_ai.processInput("headpat", m_affinity.getTier()));
     }
 
@@ -337,10 +320,46 @@ public class OverlayView extends FrameLayout {
         m_glView.onResume();
     }
 
+    /**
+     * SIGSEGV fix for Adreno (msmnile) gralloc crash in eglDestroySurface.
+     *
+     * Root cause:
+     *   The original code called queueEvent(nativeDestroy) — which is async —
+     *   and immediately called onPause() afterwards.  onPause() destroys the
+     *   EGL surface on the main thread while the GL thread may still be in the
+     *   middle of nativeRender() or flushing commands to the GPU.
+     *   The Adreno gralloc driver's ReleaseBuffer() then dereferences a
+     *   partially-freed native_handle, causing SIGSEGV SEGV_ACCERR.
+     *
+     * Fix:
+     *   1. Set m_glReady = false so onDrawFrame() stops submitting new frames.
+     *   2. Queue nativeDestroy() on the GL thread and WAIT for it to finish
+     *      (CountDownLatch with a 2-second timeout).
+     *   3. Only after nativeDestroy() has completed call onPause(), which is
+     *      now safe to destroy the EGL surface.
+     */
     @Override
     protected void onDetachedFromWindow() {
+        // Stop the render loop from submitting new frames.
         m_glReady = false;
-        m_glView.queueEvent(m_renderer::nativeDestroy);
+
+        // Queue nativeDestroy on the GL thread and block until it finishes.
+        // This ensures all OpenGL / Bullet resources are released BEFORE the
+        // EGL surface is torn down by onPause().
+        final CountDownLatch latch = new CountDownLatch(1);
+        m_glView.queueEvent(() -> {
+            m_renderer.nativeDestroy();
+            latch.countDown();
+        });
+
+        try {
+            // 2-second safety timeout prevents an ANR if the GL thread is hung.
+            latch.await(2, TimeUnit.SECONDS);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
+
+        // Now safe to destroy the EGL surface — native resources are gone.
         m_glView.onPause();
         super.onDetachedFromWindow();
     }

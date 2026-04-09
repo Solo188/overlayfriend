@@ -34,15 +34,23 @@ public class OverlayService extends Service {
     public static final String EXTRA_CHAR_NAME         = "char_name";
     public static final String ACTION_REFRESH_SETTINGS = "REFRESH_SETTINGS";
 
-    private static final String MOTIONS_BASE  = "/sdcard/Documents/Assistant/Models/";
+    /**
+     * Root folder for character assets.
+     * Expected layout:
+     *   <MOTIONS_BASE><charName>/motions/idle/      ← idle .vmd files
+     *   <MOTIONS_BASE><charName>/motions/poses/     ← static pose .vmd files
+     *   <MOTIONS_BASE><charName>/motions/waiting/   ← random-event .vmd files
+     *   <MOTIONS_BASE><charName>/motions/dance/     ← random-event dance .vmd files
+     *   <MOTIONS_BASE><charName>/motions/touch/     ← touch-reaction .vmd files
+     */
+    private static final String MOTIONS_BASE = "/sdcard/Documents/Assistant/Models/";
 
     /**
-     * Directory scanned for user-supplied VMD files.
-     * Drop any .vmd file here and the model will start playing it automatically.
+     * Drop any .vmd file here to have it loaded as a user-supplied "user" motion.
      */
     private static final String USER_MOTION_DIR = "/sdcard/Documents/Assistant/motion/";
 
-    private static final long TICK_INTERVAL    = 60_000L;
+    private static final long TICK_INTERVAL      = 60_000L;
     private static final long MOTIONS_LOAD_DELAY = 2_000L;
 
     private WindowManager   m_windowManager;
@@ -55,9 +63,7 @@ public class OverlayService extends Service {
     private String  m_charName  = "DefaultChar";
     private boolean m_nightMode = false;
 
-    // ── User motion folder watcher ─────────────────────────────────────────
-    // Tracks which VMD paths have already been loaded so we don't re-load
-    // files that were already registered with the native engine.
+    // Tracks which user VMD paths are already registered so we don't double-load.
     private final Set<String> m_loadedUserVmds = new HashSet<>();
     private FileObserver      m_motionObserver;
 
@@ -124,9 +130,6 @@ public class OverlayService extends Service {
                         | WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
                 PixelFormat.TRANSLUCENT);
 
-        // Use TOP|LEFT gravity so that params.x/y are screen-relative pixel offsets
-        // from the top-left corner.  Without this Android defaults to Gravity.CENTER,
-        // which makes (0,0) the screen centre and breaks boundary clamping.
         params.gravity = Gravity.TOP | Gravity.LEFT;
 
         SharedPreferences prefs = getSharedPreferences("overlay_state", MODE_PRIVATE);
@@ -141,10 +144,10 @@ public class OverlayService extends Service {
 
             final String charName = m_charName;
             m_handler.postDelayed(() -> {
+                // Single call: C++ auto-scans all five category folders.
                 loadMotionsForCharacter(charName);
-                // Scan the user motion folder after character motions are loaded
+                // Also scan for user-supplied VMD files.
                 scanUserMotionFolder();
-                // Start watching for new VMD files dropped into the folder
                 startMotionObserver();
             }, MOTIONS_LOAD_DELAY);
         }
@@ -162,47 +165,34 @@ public class OverlayService extends Service {
 
     // ── Character motion loading ───────────────────────────────────────────
 
+    /**
+     * Delegate scanning of all motion categories to the native engine.
+     * The C++ VMDManager::scanMotions() walks:
+     *   modelDir/motions/{idle, poses, waiting, dance, touch}
+     * and loads every .vmd file found, then auto-starts the idle layer.
+     */
     private void loadMotionsForCharacter(String charName) {
         if (m_overlayView == null) return;
 
-        String base = MOTIONS_BASE + charName + "/motions/";
-        String[] categories = {"idle", "touch", "night", "friend"};
-        boolean anyLoaded = false;
+        // modelDir is the character's root folder (contains the .pmx and /motions/)
+        final String modelDir = MOTIONS_BASE + charName;
 
-        for (String cat : categories) {
-            File folder = new File(base + cat);
-            if (!folder.isDirectory()) continue;
-            File[] vmds = folder.listFiles((d, n) -> n.toLowerCase().endsWith(".vmd"));
-            if (vmds == null) continue;
-
-            for (File vmd : vmds) {
-                final String path     = vmd.getAbsolutePath();
-                final String category = cat;
-                m_overlayView.queueGLEvent(() ->
-                        m_nativeRenderer.nativeLoadMotion(path, category));
-                anyLoaded = true;
-            }
-        }
-
-        if (anyLoaded) {
-            m_overlayView.queueGLEvent(() ->
-                    m_nativeRenderer.nativePlayMotionCategory("idle"));
-        }
+        Log.i(TAG, "Scanning motions for: " + modelDir);
+        m_overlayView.queueGLEvent(() ->
+                m_nativeRenderer.nativeScanMotions(modelDir));
     }
 
     // ── User VMD folder scanning ───────────────────────────────────────────
 
     /**
-     * Scans USER_MOTION_DIR for .vmd files that haven't been loaded yet,
-     * registers each with the native engine as category "user", then
-     * triggers playback.  Safe to call multiple times — skips already-loaded files.
+     * Scans USER_MOTION_DIR for .vmd files not yet loaded and registers each
+     * with the native engine as category "user".
      */
     private void scanUserMotionFolder() {
         if (m_overlayView == null) return;
 
         File dir = new File(USER_MOTION_DIR);
         if (!dir.exists()) {
-            // Create the folder so the user can easily find it
             //noinspection ResultOfMethodCallIgnored
             dir.mkdirs();
         }
@@ -211,23 +201,14 @@ public class OverlayService extends Service {
         File[] vmds = dir.listFiles((d, n) -> n.toLowerCase().endsWith(".vmd"));
         if (vmds == null || vmds.length == 0) return;
 
-        boolean anyNew = false;
         for (File vmd : vmds) {
             String absPath = vmd.getAbsolutePath();
             if (m_loadedUserVmds.contains(absPath)) continue;
-
             m_loadedUserVmds.add(absPath);
             final String path = absPath;
             Log.i(TAG, "Loading user VMD: " + path);
             m_overlayView.queueGLEvent(() ->
                     m_nativeRenderer.nativeLoadMotion(path, "user"));
-            anyNew = true;
-        }
-
-        if (anyNew) {
-            // Switch to playing user motions (they loop with 10 s pause in VMDManager)
-            m_overlayView.queueGLEvent(() ->
-                    m_nativeRenderer.nativePlayMotionCategory("user"));
         }
     }
 
@@ -239,16 +220,13 @@ public class OverlayService extends Service {
         File dir = new File(USER_MOTION_DIR);
         if (!dir.exists()) dir.mkdirs();
 
-        // FileObserver fires on the calling thread pool; dispatch to main thread.
         m_motionObserver = new FileObserver(USER_MOTION_DIR,
                 FileObserver.CREATE | FileObserver.MOVED_TO) {
             @Override
             public void onEvent(int event, @Nullable String path) {
                 if (path == null) return;
                 if (!path.toLowerCase().endsWith(".vmd")) return;
-
                 Log.i(TAG, "FileObserver: new VMD detected: " + path);
-                // Give the OS a moment to finish writing the file before reading it
                 m_handler.postDelayed(() -> scanUserMotionFolder(), 500);
             }
         };
