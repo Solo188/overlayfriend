@@ -7,6 +7,7 @@ import android.opengl.GLSurfaceView;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.DisplayMetrics;
+import android.util.Log;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
 import android.view.View;
@@ -16,11 +17,14 @@ import android.widget.TextView;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
 
 public class OverlayView extends FrameLayout {
+
+    private static final String TAG = "OverlayView";
 
     private final NativeRenderer             m_renderer;
     private final AffinityManager            m_affinity;
@@ -32,12 +36,20 @@ public class OverlayView extends FrameLayout {
     private TextView      m_bubble;
     private final Handler m_uiHandler = new Handler(Looper.getMainLooper());
 
-    private volatile boolean m_glReady       = false;
-    private volatile String  m_pendingPmxPath = null;
+    // true once nativeInit() has succeeded on the GL thread.
+    private volatile boolean m_glReady = false;
+
+    // PMX path stored here when loadModel() is called before GL is ready.
+    // Consumed inside onSurfaceCreated() on the GL thread.
+    private volatile String m_pendingPmxPath = null;
+
+    // Guard against duplicate concurrent model loads (e.g. fast service restart).
+    // Set to true before queuing nativeLoadModel; cleared after it returns.
+    private final AtomicBoolean m_modelLoading = new AtomicBoolean(false);
 
     // ── Touch / drag ──────────────────────────────────────────────────────
-    private float m_touchStartRawX, m_touchStartRawY;
-    private int   m_initParamX, m_initParamY;
+    private float   m_touchStartRawX, m_touchStartRawY;
+    private int     m_initParamX, m_initParamY;
     private boolean m_positionLocked = false;
     private boolean m_silentMode     = false;
 
@@ -45,20 +57,26 @@ public class OverlayView extends FrameLayout {
 
     // ── Pinch-to-zoom ─────────────────────────────────────────────────────
     private ScaleGestureDetector m_scaleDetector;
-    private float  m_currentScale  = 1.0f;
+    private float m_currentScale = 1.0f;
     private static final float SCALE_MIN = 0.4f;
     private static final float SCALE_MAX = 3.0f;
 
     // ── GL surface size ───────────────────────────────────────────────────
+    // Base size that matches the native renderer's 2:3 aspect ratio.
     private static final int GL_W_BASE = 400;
     private static final int GL_H_BASE = 600;
 
+    // Current physical pixel size (changes with pinch-to-zoom scale).
     private int m_glPixW = GL_W_BASE;
     private int m_glPixH = GL_H_BASE;
 
     private static final String PREFS_SETTINGS = "overlay_settings";
-    private static final String KEY_SCALE   = "scale";
-    private static final String KEY_OPACITY = "opacity";
+    private static final String KEY_SCALE      = "scale";
+    private static final String KEY_OPACITY    = "opacity";
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Constructor
+    // ─────────────────────────────────────────────────────────────────────
 
     public OverlayView(Context context,
                        NativeRenderer renderer,
@@ -74,7 +92,6 @@ public class OverlayView extends FrameLayout {
 
         SharedPreferences prefs = context.getSharedPreferences(PREFS_SETTINGS, Context.MODE_PRIVATE);
         m_currentScale = prefs.getFloat(KEY_SCALE, 1.0f);
-        float opacity  = prefs.getFloat(KEY_OPACITY, 1.0f);
 
         m_scaleDetector = new ScaleGestureDetector(context,
                 new ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -92,10 +109,11 @@ public class OverlayView extends FrameLayout {
         m_glPixW = (int)(GL_W_BASE * m_currentScale);
         m_glPixH = (int)(GL_H_BASE * m_currentScale);
         updateGLViewSize();
-        if (m_glReady) {
-            m_renderer.nativeSetTransform(0, 0, 1.0f, opacity);
-        }
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // GL surface
+    // ─────────────────────────────────────────────────────────────────────
 
     private void buildLayout(Context context) {
         m_glView = new GLSurfaceView(context);
@@ -107,25 +125,30 @@ public class OverlayView extends FrameLayout {
         m_glView.setRenderer(new GLSurfaceView.Renderer() {
             @Override
             public void onSurfaceCreated(GL10 gl, EGLConfig config) {
+                // Running on the GL thread.
                 m_glReady = false;
                 boolean ok = m_renderer.nativeInit(GL_W_BASE, GL_H_BASE);
-                if (ok) {
-                    m_glReady = true;
-                    String pending = m_pendingPmxPath;
-                    if (pending != null) {
-                        m_pendingPmxPath = null;
-                        m_renderer.nativeLoadModel(pending);
-                    }
-                    SharedPreferences prefs = context.getSharedPreferences(
-                            PREFS_SETTINGS, Context.MODE_PRIVATE);
-                    float opacity = prefs.getFloat(KEY_OPACITY, 1.0f);
-                    m_renderer.nativeSetTransform(0, 0, 1.0f, opacity);
+                if (!ok) { Log.e(TAG, "nativeInit failed in onSurfaceCreated"); return; }
+
+                m_glReady = true;
+
+                SharedPreferences prefs = context.getSharedPreferences(
+                        PREFS_SETTINGS, Context.MODE_PRIVATE);
+                float opacity = prefs.getFloat(KEY_OPACITY, 1.0f);
+                m_renderer.nativeSetTransform(0, 0, 1.0f, opacity);
+
+                // If a model load was requested before GL was ready, run it now.
+                String pending = m_pendingPmxPath;
+                if (pending != null) {
+                    m_pendingPmxPath = null;
+                    doLoadModel(pending);
                 }
             }
 
             @Override
             public void onSurfaceChanged(GL10 gl, int width, int height) {
                 m_renderer.nativeSurfaceChanged(width, height);
+                // Recover if onSurfaceCreated was somehow skipped.
                 if (!m_glReady && width > 0 && height > 0) {
                     boolean ok = m_renderer.nativeInit(width, height);
                     if (ok) {
@@ -133,7 +156,7 @@ public class OverlayView extends FrameLayout {
                         String pending = m_pendingPmxPath;
                         if (pending != null) {
                             m_pendingPmxPath = null;
-                            m_renderer.nativeLoadModel(pending);
+                            doLoadModel(pending);
                         }
                     }
                 }
@@ -149,6 +172,7 @@ public class OverlayView extends FrameLayout {
         m_glView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
         addView(m_glView, new FrameLayout.LayoutParams(m_glPixW, m_glPixH));
 
+        // Speech bubble overlay
         m_bubble = new TextView(context);
         m_bubble.setTextSize(14f);
         m_bubble.setTextColor(0xFFFFFFFF);
@@ -162,7 +186,57 @@ public class OverlayView extends FrameLayout {
         addView(m_bubble, lp);
     }
 
-    // ── Scale helpers ─────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────
+    // Model loading — always on the GL thread, never on the UI thread
+    // ─────────────────────────────────────────────────────────────────────
+
+    /**
+     * Request a model load.  Safe to call from any thread.
+     *
+     * If the GL context is already ready the load is enqueued on the GL thread
+     * immediately.  If not, the path is stored and picked up in onSurfaceCreated().
+     *
+     * The duplicate-load guard (m_modelLoading) prevents concurrent or repeated
+     * calls from triggering multiple loads on fast restarts.
+     */
+    public void loadModel(String pmxPath) {
+        if (pmxPath == null || pmxPath.isEmpty()) return;
+
+        if (!m_modelLoading.compareAndSet(false, true)) {
+            Log.w(TAG, "loadModel: load already in progress — ignoring duplicate call");
+            return;
+        }
+
+        if (m_glReady) {
+            m_glView.queueEvent(() -> doLoadModel(pmxPath));
+        } else {
+            // GL thread not ready yet — store for onSurfaceCreated().
+            m_pendingPmxPath = pmxPath;
+            // Note: m_modelLoading stays true until doLoadModel() is eventually called.
+        }
+    }
+
+    /**
+     * Must be called ONLY from the GL thread.
+     * Performs the actual nativeLoadModel call and clears the loading guard.
+     */
+    private void doLoadModel(String pmxPath) {
+        try {
+            Log.i(TAG, "doLoadModel: " + pmxPath);
+            m_renderer.nativeLoadModel(pmxPath);
+        } finally {
+            m_modelLoading.set(false);
+        }
+    }
+
+    /** Enqueue an arbitrary GL-thread event.  Used by OverlayService. */
+    public void queueGLEvent(Runnable r) {
+        m_glView.queueEvent(r);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Scale helpers
+    // ─────────────────────────────────────────────────────────────────────
 
     private void applyScale() {
         m_glPixW = (int)(GL_W_BASE * m_currentScale);
@@ -186,50 +260,38 @@ public class OverlayView extends FrameLayout {
         }
     }
 
-    // ── Screen bounds helper ───────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────
+    // Screen bounds
+    // ─────────────────────────────────────────────────────────────────────
 
     private int[] getScreenBounds() {
         DisplayMetrics dm = new DisplayMetrics();
-        if (m_wm != null) {
-            m_wm.getDefaultDisplay().getRealMetrics(dm);
-        }
+        if (m_wm != null) m_wm.getDefaultDisplay().getRealMetrics(dm);
         return new int[]{ 0, 0, dm.widthPixels, dm.heightPixels };
     }
 
     private int[] clampToScreen(int desiredX, int desiredY) {
-        int[] screen = getScreenBounds();
-        int maxX = screen[2] - m_glPixW;
-        int maxY = screen[3] - m_glPixH;
-        int cx = Math.max(screen[0], Math.min(maxX, desiredX));
-        int cy = Math.max(screen[1], Math.min(maxY, desiredY));
-        return new int[]{ cx, cy };
+        int[] s  = getScreenBounds();
+        int maxX = s[2] - m_glPixW;
+        int maxY = s[3] - m_glPixH;
+        return new int[]{ Math.max(s[0], Math.min(maxX, desiredX)),
+                          Math.max(s[1], Math.min(maxY, desiredY)) };
     }
 
-    // ── Settings ──────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────
+    // Public API
+    // ─────────────────────────────────────────────────────────────────────
 
     public void applySettings() {
         SharedPreferences prefs = getContext().getSharedPreferences(
                 PREFS_SETTINGS, Context.MODE_PRIVATE);
-        float scale   = prefs.getFloat(KEY_SCALE,   1.0f);
-        float opacity = prefs.getFloat(KEY_OPACITY, 1.0f);
-        m_currentScale = scale;
+        m_currentScale = prefs.getFloat(KEY_SCALE, 1.0f);
+        float opacity  = prefs.getFloat(KEY_OPACITY, 1.0f);
         applyScale();
         if (m_glReady) {
             m_glView.queueEvent(() -> m_renderer.nativeSetTransform(0, 0, 1.0f, opacity));
         }
     }
-
-    // ── Public API ────────────────────────────────────────────────────────
-
-    public void loadModel(String pmxPath) {
-        if (m_glReady) {
-            m_glView.queueEvent(() -> m_renderer.nativeLoadModel(pmxPath));
-        } else {
-            m_pendingPmxPath = pmxPath;
-        }
-    }
-
-    public void queueGLEvent(Runnable r) { m_glView.queueEvent(r); }
 
     public void showBubble(String text) {
         if (m_silentMode) return;
@@ -247,7 +309,9 @@ public class OverlayView extends FrameLayout {
 
     public void setPositionLocked(boolean l) { m_positionLocked = l; }
 
-    // ── Touch ─────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────
+    // Touch
+    // ─────────────────────────────────────────────────────────────────────
 
     @Override
     public boolean onTouchEvent(MotionEvent event) {
@@ -300,8 +364,8 @@ public class OverlayView extends FrameLayout {
     private void onHeadpat() {
         m_affinity.onHeadpat();
         if (m_glReady) {
-            // Use the priority-interrupt touch path so it overrides any
-            // currently playing waiting / dance animation immediately.
+            // nativeOnTouch() immediately interrupts any waiting/dance animation
+            // and plays a random file from the "touch" category (Layer 1 event).
             m_glView.queueEvent(() -> m_renderer.nativeOnTouch());
         }
         showBubble(m_ai.processInput("headpat", m_affinity.getTier()));
@@ -312,7 +376,9 @@ public class OverlayView extends FrameLayout {
                 .edit().putInt("pos_x", x).putInt("pos_y", y).apply();
     }
 
-    // ── Lifecycle ─────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────
+    // Lifecycle
+    // ─────────────────────────────────────────────────────────────────────
 
     @Override
     protected void onAttachedToWindow() {
@@ -324,28 +390,20 @@ public class OverlayView extends FrameLayout {
      * SIGSEGV fix for Adreno (msmnile) gralloc crash in eglDestroySurface.
      *
      * Root cause:
-     *   The original code called queueEvent(nativeDestroy) — which is async —
-     *   and immediately called onPause() afterwards.  onPause() destroys the
-     *   EGL surface on the main thread while the GL thread may still be in the
-     *   middle of nativeRender() or flushing commands to the GPU.
-     *   The Adreno gralloc driver's ReleaseBuffer() then dereferences a
-     *   partially-freed native_handle, causing SIGSEGV SEGV_ACCERR.
+     *   queueEvent(nativeDestroy) is asynchronous — calling onPause() right
+     *   after queuing it lets onPause() destroy the EGL surface while the GL
+     *   thread is still mid-render.  The Adreno gralloc ReleaseBuffer() then
+     *   dereferences a partially-freed native_handle → SIGSEGV SEGV_ACCERR.
      *
      * Fix:
-     *   1. Set m_glReady = false so onDrawFrame() stops submitting new frames.
-     *   2. Queue nativeDestroy() on the GL thread and WAIT for it to finish
-     *      (CountDownLatch with a 2-second timeout).
-     *   3. Only after nativeDestroy() has completed call onPause(), which is
-     *      now safe to destroy the EGL surface.
+     *   1. m_glReady = false  — onDrawFrame() stops submitting new frames.
+     *   2. Queue nativeDestroy() and block on a CountDownLatch until it finishes.
+     *   3. Only then call onPause(), which destroys the EGL surface safely.
      */
     @Override
     protected void onDetachedFromWindow() {
-        // Stop the render loop from submitting new frames.
         m_glReady = false;
 
-        // Queue nativeDestroy on the GL thread and block until it finishes.
-        // This ensures all OpenGL / Bullet resources are released BEFORE the
-        // EGL surface is torn down by onPause().
         final CountDownLatch latch = new CountDownLatch(1);
         m_glView.queueEvent(() -> {
             m_renderer.nativeDestroy();
@@ -353,13 +411,14 @@ public class OverlayView extends FrameLayout {
         });
 
         try {
-            // 2-second safety timeout prevents an ANR if the GL thread is hung.
-            latch.await(2, TimeUnit.SECONDS);
+            // 2-second safety timeout prevents ANR if the GL thread is hung.
+            if (!latch.await(2, TimeUnit.SECONDS)) {
+                Log.w(TAG, "nativeDestroy did not complete within 2 s — proceeding anyway");
+            }
         } catch (InterruptedException ignored) {
             Thread.currentThread().interrupt();
         }
 
-        // Now safe to destroy the EGL surface — native resources are gone.
         m_glView.onPause();
         super.onDetachedFromWindow();
     }

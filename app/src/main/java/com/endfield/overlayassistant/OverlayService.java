@@ -30,28 +30,26 @@ public class OverlayService extends Service {
     private static final String CHANNEL_ID = "endfield_overlay";
     private static final int    NOTIF_ID   = 1001;
 
-    public static final String EXTRA_PMX_PATH          = "pmx_path";
-    public static final String EXTRA_CHAR_NAME         = "char_name";
     public static final String ACTION_REFRESH_SETTINGS = "REFRESH_SETTINGS";
 
-    /**
-     * Root folder for character assets.
-     * Expected layout:
-     *   <MOTIONS_BASE><charName>/motions/idle/      ← idle .vmd files
-     *   <MOTIONS_BASE><charName>/motions/poses/     ← static pose .vmd files
-     *   <MOTIONS_BASE><charName>/motions/waiting/   ← random-event .vmd files
-     *   <MOTIONS_BASE><charName>/motions/dance/     ← random-event dance .vmd files
-     *   <MOTIONS_BASE><charName>/motions/touch/     ← touch-reaction .vmd files
-     */
-    private static final String MOTIONS_BASE = "/sdcard/Documents/Assistant/Models/";
+    // ── Folder layout ──────────────────────────────────────────────────────
+    //
+    //   /sdcard/Documents/Assistant/
+    //   ├── Yvonne.pmx
+    //   ├── textures/
+    //   └── motions/
+    //       ├── idle/      (constant idle / breath animations)
+    //       ├── poses/     (static poses used as idle base)
+    //       ├── waiting/   (random events, 70 % chance every 1-10 min)
+    //       ├── dance/     (random events, 30 % chance every 1-10 min)
+    //       └── touch/     (reactions on finger tap)
+    //
+    static final String ASSISTANT_BASE = "/sdcard/Documents/Assistant/";
+    static final String PMX_PATH       = ASSISTANT_BASE + "Yvonne.pmx";
 
-    /**
-     * Drop any .vmd file here to have it loaded as a user-supplied "user" motion.
-     */
-    private static final String USER_MOTION_DIR = "/sdcard/Documents/Assistant/motion/";
-
-    private static final long TICK_INTERVAL      = 60_000L;
+    // Delay between model load and motion scan (waits for GL to initialise).
     private static final long MOTIONS_LOAD_DELAY = 2_000L;
+    private static final long TICK_INTERVAL      = 60_000L;
 
     private WindowManager   m_windowManager;
     private OverlayView     m_overlayView;
@@ -60,10 +58,9 @@ public class OverlayService extends Service {
     private IAiAssistant    m_ai;
 
     private Handler m_handler;
-    private String  m_charName  = "DefaultChar";
     private boolean m_nightMode = false;
 
-    // Tracks which user VMD paths are already registered so we don't double-load.
+    // Tracks user-dropped VMD paths that are already registered with the engine.
     private final Set<String> m_loadedUserVmds = new HashSet<>();
     private FileObserver      m_motionObserver;
 
@@ -76,32 +73,48 @@ public class OverlayService extends Service {
         }
     };
 
+    // ── Lifecycle ──────────────────────────────────────────────────────────
+
     @Override
     public void onCreate() {
         super.onCreate();
+
+        // !! MUST happen first — Android gives 5 s before raising
+        // ForegroundServiceDidNotStartInTimeException.  Create the channel
+        // synchronously then call startForeground() before any slow init.
+        createNotificationChannel();
+        startForeground(NOTIF_ID, buildNotification());
+
+        // Heavy initialisation happens AFTER startForeground().
         m_handler        = new Handler(Looper.getMainLooper());
         m_nativeRenderer = new NativeRenderer();
         m_affinity       = new AffinityManager(this);
         m_ai             = new AiAssistantImpl(this);
         m_affinity.setOnTierChangedListener(m_nativeRenderer::nativeSetAffinityTier);
-        createNotificationChannel();
-        startForeground(NOTIF_ID, buildNotification());
+
+        // Create the full folder tree on first launch so the user knows where
+        // to place files without having to dig through the file manager.
+        ensureFolderStructure();
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent != null) {
-            if (ACTION_REFRESH_SETTINGS.equals(intent.getAction())) {
-                if (m_overlayView != null) m_overlayView.applySettings();
-                return START_STICKY;
-            }
-            if (m_overlayView == null) {
-                m_charName = intent.getStringExtra(EXTRA_CHAR_NAME);
-                if (m_charName == null) m_charName = "DefaultChar";
-                String pmxPath = intent.getStringExtra(EXTRA_PMX_PATH);
-                addOverlayWindow(pmxPath);
-            }
+        // Belt-and-suspenders: re-call startForeground() at the very top of
+        // onStartCommand() so it fires even if onCreate() was somehow delayed.
+        startForeground(NOTIF_ID, buildNotification());
+
+        if (intent == null) return START_STICKY;
+
+        if (ACTION_REFRESH_SETTINGS.equals(intent.getAction())) {
+            if (m_overlayView != null) m_overlayView.applySettings();
+            return START_STICKY;
         }
+
+        // First real start — add the overlay window.
+        if (m_overlayView == null) {
+            addOverlayWindow();
+        }
+
         return START_STICKY;
     }
 
@@ -116,9 +129,34 @@ public class OverlayService extends Service {
     @Nullable @Override
     public IBinder onBind(Intent i) { return null; }
 
+    // ── Folder structure creation ──────────────────────────────────────────
+
+    /**
+     * Create the full /sdcard/Documents/Assistant/ tree on first launch.
+     * mkdirs() is a no-op if a folder already exists.
+     */
+    private void ensureFolderStructure() {
+        String[] dirs = {
+            ASSISTANT_BASE + "textures",
+            ASSISTANT_BASE + "motions/idle",
+            ASSISTANT_BASE + "motions/poses",
+            ASSISTANT_BASE + "motions/waiting",
+            ASSISTANT_BASE + "motions/dance",
+            ASSISTANT_BASE + "motions/touch",
+        };
+        for (String dir : dirs) {
+            File f = new File(dir);
+            if (!f.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                f.mkdirs();
+                Log.i(TAG, "Created folder: " + dir);
+            }
+        }
+    }
+
     // ── Window management ──────────────────────────────────────────────────
 
-    private void addOverlayWindow(String pmxPath) {
+    private void addOverlayWindow() {
         m_windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
 
         WindowManager.LayoutParams params = new WindowManager.LayoutParams(
@@ -130,6 +168,7 @@ public class OverlayService extends Service {
                         | WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
                 PixelFormat.TRANSLUCENT);
 
+        // Use TOP|LEFT gravity so params.x/y are screen-relative pixel offsets.
         params.gravity = Gravity.TOP | Gravity.LEFT;
 
         SharedPreferences prefs = getSharedPreferences("overlay_state", MODE_PRIVATE);
@@ -139,18 +178,17 @@ public class OverlayService extends Service {
         m_overlayView = new OverlayView(this, m_nativeRenderer, m_affinity, m_ai, params);
         m_windowManager.addView(m_overlayView, params);
 
-        if (pmxPath != null && !pmxPath.isEmpty()) {
-            m_overlayView.loadModel(pmxPath);
+        // loadModel() enqueues nativeLoadModel on the GL thread — never blocks UI.
+        m_overlayView.loadModel(PMX_PATH);
 
-            final String charName = m_charName;
-            m_handler.postDelayed(() -> {
-                // Single call: C++ auto-scans all five category folders.
-                loadMotionsForCharacter(charName);
-                // Also scan for user-supplied VMD files.
-                scanUserMotionFolder();
-                startMotionObserver();
-            }, MOTIONS_LOAD_DELAY);
-        }
+        // After the GL thread has initialised and loaded the model,
+        // scan the motions folder.  nativeScanMotions goes via queueGLEvent.
+        m_handler.postDelayed(() -> {
+            if (m_overlayView == null) return;
+            m_overlayView.queueGLEvent(() ->
+                    m_nativeRenderer.nativeScanMotions(ASSISTANT_BASE));
+            startMotionObserver();
+        }, MOTIONS_LOAD_DELAY);
 
         m_handler.postDelayed(m_tickRunnable, TICK_INTERVAL);
         checkNightMode();
@@ -163,81 +201,61 @@ public class OverlayService extends Service {
         }
     }
 
-    // ── Character motion loading ───────────────────────────────────────────
+    // ── User VMD folder watcher ────────────────────────────────────────────
 
     /**
-     * Delegate scanning of all motion categories to the native engine.
-     * The C++ VMDManager::scanMotions() walks:
-     *   modelDir/motions/{idle, poses, waiting, dance, touch}
-     * and loads every .vmd file found, then auto-starts the idle layer.
+     * Watch for .vmd files dropped into motions sub-folders at runtime.
+     * Registers each new file with the engine on the GL thread.
      */
-    private void loadMotionsForCharacter(String charName) {
-        if (m_overlayView == null) return;
-
-        // modelDir is the character's root folder (contains the .pmx and /motions/)
-        final String modelDir = MOTIONS_BASE + charName;
-
-        Log.i(TAG, "Scanning motions for: " + modelDir);
-        m_overlayView.queueGLEvent(() ->
-                m_nativeRenderer.nativeScanMotions(modelDir));
-    }
-
-    // ── User VMD folder scanning ───────────────────────────────────────────
-
-    /**
-     * Scans USER_MOTION_DIR for .vmd files not yet loaded and registers each
-     * with the native engine as category "user".
-     */
-    private void scanUserMotionFolder() {
-        if (m_overlayView == null) return;
-
-        File dir = new File(USER_MOTION_DIR);
-        if (!dir.exists()) {
-            //noinspection ResultOfMethodCallIgnored
-            dir.mkdirs();
-        }
-        if (!dir.isDirectory()) return;
-
-        File[] vmds = dir.listFiles((d, n) -> n.toLowerCase().endsWith(".vmd"));
-        if (vmds == null || vmds.length == 0) return;
-
-        for (File vmd : vmds) {
-            String absPath = vmd.getAbsolutePath();
-            if (m_loadedUserVmds.contains(absPath)) continue;
-            m_loadedUserVmds.add(absPath);
-            final String path = absPath;
-            Log.i(TAG, "Loading user VMD: " + path);
-            m_overlayView.queueGLEvent(() ->
-                    m_nativeRenderer.nativeLoadMotion(path, "user"));
-        }
-    }
-
-    // ── FileObserver — watch for new VMD files in real time ───────────────
-
     private void startMotionObserver() {
         stopMotionObserver();
 
-        File dir = new File(USER_MOTION_DIR);
+        String watchDir = ASSISTANT_BASE + "motions/";
+        File dir = new File(watchDir);
         if (!dir.exists()) dir.mkdirs();
 
-        m_motionObserver = new FileObserver(USER_MOTION_DIR,
+        m_motionObserver = new FileObserver(watchDir,
                 FileObserver.CREATE | FileObserver.MOVED_TO) {
             @Override
             public void onEvent(int event, @Nullable String path) {
-                if (path == null) return;
-                if (!path.toLowerCase().endsWith(".vmd")) return;
+                if (path == null || !path.toLowerCase().endsWith(".vmd")) return;
                 Log.i(TAG, "FileObserver: new VMD detected: " + path);
-                m_handler.postDelayed(() -> scanUserMotionFolder(), 500);
+                m_handler.postDelayed(() -> scanUserVmds(), 500);
             }
         };
         m_motionObserver.startWatching();
-        Log.i(TAG, "Watching for VMD files in: " + USER_MOTION_DIR);
+        Log.i(TAG, "Watching for VMD files in: " + watchDir);
     }
 
     private void stopMotionObserver() {
         if (m_motionObserver != null) {
             m_motionObserver.stopWatching();
             m_motionObserver = null;
+        }
+    }
+
+    /**
+     * Walk all motion sub-folders looking for .vmd files not yet registered.
+     * New files are loaded into the native engine on the GL thread.
+     */
+    private void scanUserVmds() {
+        if (m_overlayView == null) return;
+        String[] subDirs = { "idle", "poses", "waiting", "dance", "touch" };
+        for (String cat : subDirs) {
+            File folder = new File(ASSISTANT_BASE + "motions/" + cat);
+            if (!folder.isDirectory()) continue;
+            File[] vmds = folder.listFiles((d, n) -> n.toLowerCase().endsWith(".vmd"));
+            if (vmds == null) continue;
+            for (File vmd : vmds) {
+                String abs = vmd.getAbsolutePath();
+                if (m_loadedUserVmds.contains(abs)) continue;
+                m_loadedUserVmds.add(abs);
+                final String p = abs;
+                final String c = cat;
+                Log.i(TAG, "Hot-loading VMD [" + c + "]: " + p);
+                m_overlayView.queueGLEvent(() ->
+                        m_nativeRenderer.nativeLoadMotion(p, c));
+            }
         }
     }
 
@@ -282,7 +300,7 @@ public class OverlayService extends Service {
 
         return new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setContentTitle("Endfield Overlay")
-                .setContentText("Tap to open · " + m_charName)
+                .setContentText("Yvonne is running")
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
                 .setContentIntent(openPi)
                 .addAction(android.R.drawable.ic_media_pause, "Stop", stopPi)
