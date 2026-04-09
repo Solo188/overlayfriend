@@ -23,8 +23,6 @@ import java.io.File;
 
 public class MainActivity extends AppCompatActivity {
 
-    private static final String MODELS_BASE = "/sdcard/Documents/Assistant/Models/";
-
     private Switch   m_switchOverlay;
     private Switch   m_switchNotifs;
     private Button   m_btnStartStop;
@@ -33,9 +31,10 @@ public class MainActivity extends AppCompatActivity {
     private TextView m_tvCharSelected;
 
     private AffinityManager m_affinity;
-    private String          m_selectedPmxPath  = "";
-    private String          m_selectedCharName = "";
-    private boolean         m_serviceRunning   = false;
+    private boolean         m_serviceRunning = false;
+
+    // true when Yvonne.pmx exists at the expected location
+    private boolean m_modelReady = false;
 
     private final ActivityResultLauncher<Intent> m_overlayPermLauncher =
         registerForActivityResult(
@@ -54,8 +53,8 @@ public class MainActivity extends AppCompatActivity {
         registerForActivityResult(
             new ActivityResultContracts.StartActivityForResult(),
             result -> {
-                // After user returns from settings — re-scan models
-                scanCharacterFolders();
+                // After user returns from settings — re-check the model file
+                checkModelFile();
             }
         );
 
@@ -71,15 +70,15 @@ public class MainActivity extends AppCompatActivity {
         refreshPermissionSwitches();
 
         // Request full storage access if not granted — needed to read .pmx files
-        // from /sdcard/Documents/ which are not media files
+        // from /sdcard/Documents/ (not a media file, needs MANAGE_EXTERNAL_STORAGE)
         requestStoragePermissionIfNeeded();
     }
 
     @Override
     protected void onResume() {
-        super.onResume();;
+        super.onResume();
         refreshPermissionSwitches();
-        scanCharacterFolders();
+        checkModelFile();
         updateAffinityDisplay();
     }
 
@@ -119,27 +118,26 @@ public class MainActivity extends AppCompatActivity {
 
     /**
      * On Android 11+ (API 30+) reading arbitrary files from /sdcard/Documents/
-     * requires MANAGE_EXTERNAL_STORAGE. READ_EXTERNAL_STORAGE only covers
+     * requires MANAGE_EXTERNAL_STORAGE.  READ_EXTERNAL_STORAGE only covers
      * media files; .pmx is not a media file so it requires full storage access.
      */
     private void requestStoragePermissionIfNeeded() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             if (!Environment.isExternalStorageManager()) {
                 Toast.makeText(this,
-                    "Storage permission needed to find .pmx models",
+                    "Storage permission needed to read Yvonne.pmx",
                     Toast.LENGTH_LONG).show();
                 Intent intent = new Intent(
                     Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
                     Uri.parse("package:" + getPackageName()));
                 m_storagePermLauncher.launch(intent);
             } else {
-                // Already have permission — scan immediately
-                scanCharacterFolders();
+                checkModelFile();
                 updateAffinityDisplay();
             }
         } else {
             // API 29 and below — READ_EXTERNAL_STORAGE is enough
-            scanCharacterFolders();
+            checkModelFile();
             updateAffinityDisplay();
         }
     }
@@ -149,17 +147,19 @@ public class MainActivity extends AppCompatActivity {
             Toast.makeText(this, "Overlay permission required", Toast.LENGTH_SHORT).show();
             return;
         }
-        if (m_selectedPmxPath.isEmpty()) {
-            // Check storage permission first
+
+        if (!m_modelReady) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
                     && !Environment.isExternalStorageManager()) {
                 Toast.makeText(this,
                     "Grant 'All Files Access' permission first",
                     Toast.LENGTH_LONG).show();
                 requestStoragePermissionIfNeeded();
-                return;
+            } else {
+                Toast.makeText(this,
+                    "Yvonne.pmx not found in " + OverlayService.ASSISTANT_BASE,
+                    Toast.LENGTH_LONG).show();
             }
-            Toast.makeText(this, "No .pmx model found in Models/", Toast.LENGTH_SHORT).show();
             return;
         }
 
@@ -168,56 +168,35 @@ public class MainActivity extends AppCompatActivity {
             m_serviceRunning = false;
             m_btnStartStop.setText(R.string.btn_start);
         } else {
+            // PMX path is hardcoded in OverlayService — no extras needed.
             Intent svc = new Intent(this, OverlayService.class);
-            svc.putExtra(OverlayService.EXTRA_PMX_PATH,  m_selectedPmxPath);
-            svc.putExtra(OverlayService.EXTRA_CHAR_NAME, m_selectedCharName);
             startForegroundService(svc);
             m_serviceRunning = true;
             m_btnStartStop.setText(R.string.btn_stop);
         }
     }
 
-    private void scanCharacterFolders() {
-        // Check storage access before scanning
+    /**
+     * Check whether the hardcoded model file exists and update the UI.
+     * The model path is fixed: ASSISTANT_BASE + "Yvonne.pmx".
+     */
+    private void checkModelFile() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
                 && !Environment.isExternalStorageManager()) {
             m_tvCharSelected.setText("⚠ Grant 'All Files Access' in settings above");
+            m_modelReady = false;
             return;
         }
 
-        File base = new File(MODELS_BASE);
-        if (!base.exists()) {
-            m_tvCharSelected.setText(R.string.no_models_found);
-            return;
-        }
-
-        // Search sub-folders (each is a character folder containing a .pmx)
-        File[] chars = base.listFiles(File::isDirectory);
-        if (chars != null) {
-            for (File charDir : chars) {
-                File[] pmxFiles = charDir.listFiles(
-                    (d, n) -> n.toLowerCase().endsWith(".pmx"));
-                if (pmxFiles != null && pmxFiles.length > 0) {
-                    m_selectedCharName = charDir.getName();
-                    m_selectedPmxPath  = pmxFiles[0].getAbsolutePath();
-                    m_tvCharSelected.setText(
-                        getString(R.string.selected_char, m_selectedCharName));
-                    return;
-                }
-            }
-        }
-
-        // Also check for .pmx files directly in the Models/ root (flat layout)
-        File[] rootPmx = base.listFiles((d, n) -> n.toLowerCase().endsWith(".pmx"));
-        if (rootPmx != null && rootPmx.length > 0) {
-            m_selectedCharName = rootPmx[0].getName().replaceFirst("\\.pmx$", "");
-            m_selectedPmxPath  = rootPmx[0].getAbsolutePath();
+        File pmx = new File(OverlayService.PMX_PATH);
+        if (pmx.exists()) {
+            m_modelReady = true;
+            m_tvCharSelected.setText(getString(R.string.selected_char, "Yvonne"));
+        } else {
+            m_modelReady = false;
             m_tvCharSelected.setText(
-                getString(R.string.selected_char, m_selectedCharName));
-            return;
+                "Place Yvonne.pmx in " + OverlayService.ASSISTANT_BASE);
         }
-
-        m_tvCharSelected.setText(R.string.no_models_found);
     }
 
     private void refreshPermissionSwitches() {
@@ -231,8 +210,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void updateAffinityDisplay() {
-        int score    = m_affinity.getScore();
-        String tier  = m_affinity.getTierName();
+        int score   = m_affinity.getScore();
+        String tier = m_affinity.getTierName();
         m_tvAffinity.setText(getString(R.string.affinity_display, score, tier));
     }
 }

@@ -55,6 +55,13 @@ public class OverlayView extends FrameLayout {
 
     private static final int HEADPAT_SLOP_PX = 20;
 
+    // ── Drag velocity for jiggle physics ──────────────────────────────────
+    // Tracks screen-space window movement velocity (pixels / second) and
+    // forwards it to the native physics engine on each ACTION_MOVE event.
+    private long  m_lastMoveTimeNs = 0;
+    private float m_lastRawX       = 0f;
+    private float m_lastRawY       = 0f;
+
     // ── Pinch-to-zoom ─────────────────────────────────────────────────────
     private ScaleGestureDetector m_scaleDetector;
     private float m_currentScale = 1.0f;
@@ -330,10 +337,13 @@ public class OverlayView extends FrameLayout {
 
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
-                m_touchStartRawX = rawX;
-                m_touchStartRawY = rawY;
-                m_initParamX     = m_params.x;
-                m_initParamY     = m_params.y;
+                m_touchStartRawX  = rawX;
+                m_touchStartRawY  = rawY;
+                m_initParamX      = m_params.x;
+                m_initParamY      = m_params.y;
+                m_lastRawX        = rawX;
+                m_lastRawY        = rawY;
+                m_lastMoveTimeNs  = System.nanoTime();
                 return true;
 
             case MotionEvent.ACTION_MOVE:
@@ -347,6 +357,23 @@ public class OverlayView extends FrameLayout {
                         try { m_wm.updateViewLayout(this, m_params); }
                         catch (Exception ignored) {}
                     }
+
+                    // ── Compute drag velocity for jiggle physics ──────────
+                    // velocity (pixels/second) = displacement / elapsed time
+                    long nowNs = System.nanoTime();
+                    long dtNs  = nowNs - m_lastMoveTimeNs;
+                    if (dtNs > 0) {
+                        float dtSec = dtNs / 1_000_000_000f;
+                        final float vx = (rawX - m_lastRawX) / dtSec;
+                        final float vy = (rawY - m_lastRawY) / dtSec;
+                        if (m_glReady) {
+                            m_glView.queueEvent(() ->
+                                    m_renderer.nativeSetDragVelocity(vx, vy));
+                        }
+                    }
+                    m_lastMoveTimeNs = nowNs;
+                    m_lastRawX       = rawX;
+                    m_lastRawY       = rawY;
                 }
                 return true;
 
@@ -356,6 +383,11 @@ public class OverlayView extends FrameLayout {
                 if (Math.abs(dx) < HEADPAT_SLOP_PX && Math.abs(dy) < HEADPAT_SLOP_PX)
                     onHeadpat();
                 savePosition(m_params.x, m_params.y);
+                // Reset velocity to zero — Bullet physics will damp out naturally.
+                if (m_glReady) {
+                    m_glView.queueEvent(() ->
+                            m_renderer.nativeSetDragVelocity(0f, 0f));
+                }
                 return true;
         }
         return super.onTouchEvent(event);
