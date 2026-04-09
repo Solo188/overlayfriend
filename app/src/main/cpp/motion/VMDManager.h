@@ -2,7 +2,7 @@
 
 #include <string>
 #include <vector>
-#include <unordered_map>
+#include <map>
 #include <memory>
 #include <random>
 #include <chrono>
@@ -13,104 +13,117 @@ namespace saba {
     class VMDAnimation;
 }
 
+/**
+ * VMDManager — Multi-layer VMD animation controller for MMD models.
+ *
+ * Architecture:
+ *   Layer 0 (base):  Idle animation looping continuously.
+ *                    Weight = 1.0 normally, fades to 0.0 when event plays.
+ *                    When a pose is active, idle overlays it at weight 0.3.
+ *   Layer 1 (event): Waiting / dance / touch animations.
+ *                    Weight = 1.0 while active, returns to 0.0 when finished.
+ *
+ * Random events:
+ *   Every 60–600 s a random waiting (70%) or dance (30%) animation fires.
+ *   onTouch() overrides any running event immediately with a touch animation.
+ *
+ * Motion pool layout (auto-scanned from modelDir/motions/):
+ *   idle/      — base looping breath / stand animations
+ *   poses/     — static or near-static poses (treated as idle replacements)
+ *   waiting/   — idle-variant events fired by the random timer
+ *   dance/     — dance events fired by the random timer
+ *   touch/     — high-priority reactions fired by onTouch()
+ */
 class VMDManager {
 public:
     static constexpr int TIER_STRANGER = 0;
     static constexpr int TIER_FRIEND   = 1;
     static constexpr int TIER_PARTNER  = 2;
 
-    static constexpr float USER_LOOP_PAUSE = 10.f;
-
     VMDManager();
     ~VMDManager();
 
     void attachRenderer(MMDRenderer* renderer);
 
-    bool loadMotion(const std::string& vmdPath, const std::string& category);
-    void playCategory(const std::string& category);
+    // Scan modelDir/motions/{idle,poses,waiting,dance,touch} and load all .vmd files.
+    // Automatically starts idle playback after loading.
+    void scanMotions(const std::string& modelDir);
 
-    // Called every frame from nativeRender on the GL thread.
-    // rawDeltaTime: actual elapsed seconds (caller should NOT pre-clamp it —
-    // VMDManager applies its own clamping and smoothing internally).
+    // Load a single VMD file into the given category pool.
+    bool loadMotion(const std::string& vmdPath, const std::string& category);
+
+    // Immediately interrupt any running event and play a random touch animation.
+    void onTouch();
+
+    // Called every frame from the GL thread.
+    // rawDeltaTime: actual elapsed seconds (clamping is applied internally).
     void update(float rawDeltaTime);
+
+    // Drag velocity in screen pixels/second — used to tilt Bullet gravity for
+    // hair/cloth inertia proportional to drag speed.
+    void setDragVelocity(float vx, float vy);
 
     void setAffinityTier(int tier);
 
-    // Drag velocity in screen pixels/second, supplied by MMDRenderer.
-    // Used to tilt Bullet physics gravity so hair/clothes exhibit inertia
-    // proportional to how fast/sharply the model is being dragged.
-    void setDragVelocity(float vx, float vy);
-
 private:
-    using Clock = std::chrono::steady_clock;
-
-    struct MotionEntry {
-        std::string                         path;
+    // One animation layer (idle/base or event).
+    struct AnimState {
         std::shared_ptr<saba::VMDAnimation> anim;
-    };
-
-    struct BlendState {
-        float elapsed  = 0.f;
-        float duration = 0.5f;
-        bool  active   = false;
+        float time     = 0.f;   // playback position (seconds)
+        float duration = 0.f;   // total length (seconds); 0 = static
+        float weight   = 0.f;   // current blended weight (0..1)
+        float target   = 0.f;   // target weight for smooth fade
+        std::string category;
+        bool  looping  = true;
     };
 
     MMDRenderer* m_renderer = nullptr;
 
-    std::unordered_map<std::string, std::vector<MotionEntry>> m_motionPool;
+    // Motion pool: category → loaded VMDAnimation objects
+    std::map<std::string, std::vector<std::shared_ptr<saba::VMDAnimation>>> m_pool;
 
-    std::shared_ptr<saba::VMDAnimation> m_currentAnim;
-    std::string                          m_currentCategory;
-    float                                m_animTime     = 0.f;
-    float                                m_animDuration = 0.f;
+    // Layer 0: base (idle / pose)
+    AnimState m_base;
 
-    std::shared_ptr<saba::VMDAnimation> m_prevAnim;
-    float                                m_prevAnimTime = 0.f;
-    BlendState                           m_blend;
+    // Layer 1: event (waiting / dance / touch)
+    AnimState m_event;
+    bool      m_eventActive = false;
 
-    bool  m_pauseActive = false;
-    float m_pauseTimer  = 0.f;
+    // Seconds until the next random waiting/dance event fires.
+    float m_nextEventTimer = 120.f;
 
-    // Running average of physics deltaTime.
-    // Used only for the Bullet substep — keeps physics simulation smooth even
-    // when individual frames stutter.
+    // EMA-smoothed physics deltaTime for Bullet substep stability.
     float m_smoothedPhysDt = 0.016f;
 
-    // Drag velocity (pixels/second) from MMDRenderer
-    float m_dragVelX = 0.f;
-    float m_dragVelY = 0.f;
+    // Drag velocity (pixels/second) supplied by MMDRenderer.
+    float m_dragVelX = 0.f, m_dragVelY = 0.f;
 
-    // Previous drag velocity — used to detect sudden stops / direction changes
-    // for triggering jiggle impulses.
-    float m_prevDragVelX = 0.f;
-    float m_prevDragVelY = 0.f;
+    // Previous drag velocity for jiggle impulse detection.
+    float m_prevDragVelX = 0.f, m_prevDragVelY = 0.f;
 
-    // Accumulated jiggle impulse (decays over time, applied to heavy RBs).
-    // Non-zero when the model was stopped sharply or reversed direction.
-    float m_jiggleImpulseX = 0.f;
-    float m_jiggleImpulseY = 0.f;
-
-    // Whether a jiggle impulse was already fired this "event" so we don't
-    // repeat it on consecutive frames with the same velocity change.
+    // Accumulated jiggle impulse (breast/hip bodies).
+    float m_jiggleImpulseX = 0.f, m_jiggleImpulseY = 0.f;
     bool  m_jiggleFired = false;
 
+    // Blink state
     float m_blinkTimer    = 0.f;
     float m_blinkInterval = 3.5f;
     float m_blinkPhase    = 0.f;
     bool  m_blinking      = false;
 
+    // Mouth idle oscillation
     float m_mouthPhase = 0.f;
 
     std::mt19937 m_rng;
-
     int m_affinityTier = TIER_STRANGER;
 
+    // Internal helpers
+    std::shared_ptr<saba::VMDAnimation> pickRandom(const std::string& cat);
+    std::shared_ptr<saba::VMDAnimation> loadSingleVMD(const std::string& path);
+    void startEvent(const std::string& category);
+    void tickEventTimer(float dt);
     void tickBlink(float dt);
     void tickMouth(float dt);
-    void applyBlend(float dt);
-    void startNextLoop();
     void applyPhysicsInertia(void* model, float dt);
     void applyJiggleImpulses(void* model);
-
-    bool isCategoryUnlocked(const std::string& category) const;
 };

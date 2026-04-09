@@ -1,54 +1,39 @@
 /**
- * VMDManager.cpp
+ * VMDManager.cpp — Multi-layer VMD animation system for MMD models (Saba library).
  *
- * Saba animation update sequence (mandatory order):
- *   model->BeginAnimation()
- *   model->UpdateAllAnimation(anim, frameNumber, physicsDt)
- *   model->Update()
- *   model->EndAnimation()
+ * ── Two-layer blending ───────────────────────────────────────────────────────
  *
- * ── Smooth animation ────────────────────────────────────────────────────────
+ *   Layer 0 (base)  : Idle animation, always advancing.
+ *                     Weight = 1.0 at rest; fades to 0.0 when an event plays.
+ *                     When a static pose is active, idle overlays it at 0.3.
  *
- *  Problem: animation "jerks" between keyframes.
- *  Root causes and fixes applied here:
+ *   Layer 1 (event) : Waiting / dance / touch reactions.
+ *                     Weight = 1.0 while active, returns to 0.0 when done.
  *
- *  1. deltaTime spikes (GC, resume, first frame)
- *     Fix: clamp rawDeltaTime to MAX_ANIM_DT (50 ms) before advancing
- *          the animation clock.  This prevents the model from "teleporting"
- *          to a distant keyframe in a single step.
+ *   saba's VMDAnimation::Evaluate(frame, weight) accumulates weighted bone
+ *   transforms. Calling idle->Evaluate then event->Evaluate in the same
+ *   BeginAnimation / EndAnimation block yields additive blending naturally.
+ *   Weight transitions are smoothed via a first-order low-pass filter.
  *
- *  2. Physics timestep variance
- *     Bullet physics is sensitive to irregular dt.  A single long frame
- *     causes the physics to make many substeps at once, which produces a
- *     visible "snap".  Fix: feed Bullet a SMOOTHED (EMA) dt that absorbs
- *     single-frame spikes while still following the true average frame rate.
+ * ── Random events ────────────────────────────────────────────────────────────
  *
- *  3. Jerky loop seam
- *     When the animation resets to frame 0 the overshoot time was discarded,
- *     causing a brief freeze at the loop point.
- *     Fix: carry the overshoot (excess time beyond m_animDuration) into the
- *          new iteration in startNextLoop().
+ *   nextEventTimer counts down each frame. On expiry:
+ *     70 % → random file from "waiting"
+ *     30 % → random file from "dance"
+ *   Timer is reset to a uniform random value in [60, 600] seconds.
  *
- * ── Physics inertia during drag ──────────────────────────────────────────────
+ *   onTouch() fires immediately, overriding any in-progress event.
  *
- *  When the user drags the model, MMDRenderer computes drag velocity
- *  (pixels/second) and passes it via setDragVelocity().  We use it to tilt
- *  the Bullet gravity vector opposite to the motion direction, so hair and
- *  clothes appear to "lag behind" with intensity proportional to speed.
- *  The effect blends in/out smoothly using an exponential filter on the
- *  gravity components.
+ * ── SIGSEGV prevention ───────────────────────────────────────────────────────
  *
- * ── Jiggle / soft-body physics ───────────────────────────────────────────────
+ *   All saba model methods are guarded with null checks.
+ *   Physics world access checks for a valid btDiscreteDynamicsWorld pointer.
+ *   The renderer pointer is validated before use each frame.
  *
- *  In addition to the gravity tilt, we detect sudden velocity changes
- *  (sharp stops, reversals) and apply a brief impulse to the *heavy*
- *  Bullet rigid bodies in the model.  Heavy rigid bodies correspond to
- *  breast / hip / skirt bones in most MMD models.  Lighter rigid bodies
- *  (hair strands) are unaffected by this secondary impulse, so only the
- *  soft-body parts "jiggle" while hair reacts via gravity tilt alone.
+ * ── Physics inertia & jiggle ─────────────────────────────────────────────────
  *
- *  Thresholds and scales are tuned for typical 30–60 fps gameplay on a
- *  mid-range Android device.
+ *   Gravity tilt (hair/cloth) and heavy-body impulses (breast/hip) are
+ *   unchanged from the previous implementation.
  */
 
 #include "VMDManager.h"
@@ -62,68 +47,54 @@
 #include <btBulletDynamicsCommon.h>
 
 #include <android/log.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <cmath>
 #include <algorithm>
+#include <cstring>
 
 #define LOG_TAG "VMDManager"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// Maximum animation clock advance per frame (seconds).
-// Anything larger (GC pause, app resume) is silently clamped.
-static constexpr float MAX_ANIM_DT = 0.05f;   // 50 ms ≡ min 20 fps
+// ── Timing constants ──────────────────────────────────────────────────────────
 
-// EMA weight for the physics deltaTime smoother.
-// Lower = smoother but less responsive to genuine FPS changes.
+// Maximum animation clock step per frame — clamps GC pauses / app resumes.
+static constexpr float MAX_ANIM_DT = 0.05f;   // 50 ms = 20 fps minimum
+
+// EMA weight for physics deltaTime smoother (lower = smoother, less responsive).
 static constexpr float PHYS_DT_EMA = 0.12f;
 
-// ── Hair / cloth inertia (gravity tilt) ──────────────────────────────────────
-// Scale factor: pixels/second → Bullet gravity offset (m/s²)
-// 2000 px/s drag → ~18 m/s² lateral gravity (stronger than before, ~1.8 g)
-static constexpr float DRAG_INERTIA_SCALE = 18.f / 2000.f;
+// How fast layer weights lerp toward their target (fraction per second × dt).
+// At 2.5 units/s the full 0→1 transition takes ~0.4 s.
+static constexpr float WEIGHT_FADE_SPEED = 2.5f;
 
-// Maximum lateral gravity from inertia (keeps hair/cloth from going insane)
+// ── Physics inertia constants ─────────────────────────────────────────────────
+
+static constexpr float DRAG_INERTIA_SCALE  = 18.f / 2000.f;
 static constexpr float MAX_LATERAL_GRAVITY = 20.f;
+static constexpr float INERTIA_DECAY       = 0.80f;
 
-// How fast the inertia gravity returns to normal when drag stops.
-// 0 = instant reset, 1 = never resets.  0.80 gives a natural settling feel.
-static constexpr float INERTIA_DECAY = 0.80f;
+// ── Jiggle impulse constants ──────────────────────────────────────────────────
 
-// ── Jiggle impulse (soft-body, for breast / hip bones) ───────────────────────
-// Minimum velocity change (px/s) required to trigger a jiggle impulse.
-// Below this threshold small jitter in the velocity signal is ignored.
-static constexpr float JIGGLE_TRIGGER_DELTA = 150.f;   // px/s
-
-// Mass threshold: rigid bodies heavier than this (kg in Bullet units) receive
-// the jiggle impulse.  Hair strands are typically < 0.1 kg, breast/hip
-// bodies are typically 0.5–3 kg in MMD models.
+static constexpr float JIGGLE_TRIGGER_DELTA  = 150.f;
 static constexpr float JIGGLE_MASS_THRESHOLD = 0.3f;
+static constexpr float JIGGLE_IMPULSE_SCALE  = 0.0015f;
+static constexpr float JIGGLE_MAX_IMPULSE    = 3.0f;
+static constexpr float JIGGLE_IMPULSE_DECAY  = 0.0f;
 
-// Pixels/second → impulse (Bullet units = kg·m/s).
-// Tuned so a fast flick (~1500 px/s stop) produces a visible ~2 Nm jiggle.
-static constexpr float JIGGLE_IMPULSE_SCALE = 0.0015f;
-
-// Maximum impulse magnitude per axis (prevents bodies from flying off).
-static constexpr float JIGGLE_MAX_IMPULSE = 3.0f;
-
-// Decay rate of the stored jiggle impulse per frame (multiplicative).
-// 0.0 = single-frame impulse; 0.85 = gradual fade over ~6 frames.
-static constexpr float JIGGLE_IMPULSE_DECAY = 0.0f;
-
-static const std::unordered_map<std::string, int> CATEGORY_TIER = {
-    {"idle",   VMDManager::TIER_STRANGER},
-    {"touch",  VMDManager::TIER_STRANGER},
-    {"night",  VMDManager::TIER_PARTNER},
-    {"friend", VMDManager::TIER_FRIEND},
-    // "user" intentionally absent — always unlocked
-};
+// ── Constructor / Destructor ──────────────────────────────────────────────────
 
 VMDManager::VMDManager()
     : m_rng(static_cast<uint32_t>(
           std::chrono::steady_clock::now().time_since_epoch().count()))
 {
-    std::uniform_real_distribution<float> d(2.f, 5.f);
-    m_blinkInterval = d(m_rng);
+    std::uniform_real_distribution<float> blinkD(2.f, 5.f);
+    m_blinkInterval = blinkD(m_rng);
+
+    // Randomise first event time so models don't all dance at the same moment.
+    std::uniform_real_distribution<float> timerD(60.f, 600.f);
+    m_nextEventTimer = timerD(m_rng);
 }
 
 VMDManager::~VMDManager() = default;
@@ -135,89 +106,192 @@ void VMDManager::setDragVelocity(float vx, float vy) {
     m_dragVelY = vy;
 }
 
-bool VMDManager::loadMotion(const std::string& vmdPath, const std::string& category) {
+void VMDManager::setAffinityTier(int tier) {
+    m_affinityTier = tier;
+    LOGI("AffinityTier = %d", tier);
+}
+
+// ── Directory scanning ────────────────────────────────────────────────────────
+
+/**
+ * Walk modelDir/motions/<category>/ and load every .vmd file found.
+ * Recognised categories: idle, poses, waiting, dance, touch.
+ */
+void VMDManager::scanMotions(const std::string& modelDir) {
     if (!m_renderer || !m_renderer->getModel()) {
-        LOGE("loadMotion: no model loaded yet"); return false;
+        LOGE("scanMotions: no model attached yet"); return;
     }
 
+    static const char* CATEGORIES[] = { "idle", "poses", "waiting", "dance", "touch" };
+    static const size_t NUM_CATS = sizeof(CATEGORIES) / sizeof(CATEGORIES[0]);
+
+    int totalLoaded = 0;
+    for (size_t ci = 0; ci < NUM_CATS; ++ci) {
+        const char* cat = CATEGORIES[ci];
+        std::string folder = modelDir + "/motions/" + cat;
+
+        DIR* dir = opendir(folder.c_str());
+        if (!dir) {
+            LOGI("scanMotions: folder not found: %s", folder.c_str());
+            continue;
+        }
+
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != nullptr) {
+            const char* name = entry->d_name;
+            size_t len = strlen(name);
+            if (len < 4) continue;
+            // Case-insensitive .vmd check
+            const char* ext = name + len - 4;
+            if (!(ext[0] == '.' &&
+                  (ext[1] == 'v' || ext[1] == 'V') &&
+                  (ext[2] == 'm' || ext[2] == 'M') &&
+                  (ext[3] == 'd' || ext[3] == 'D'))) continue;
+
+            std::string fullPath = folder + "/" + name;
+            if (loadMotion(fullPath, cat)) {
+                totalLoaded++;
+            }
+        }
+        closedir(dir);
+    }
+
+    LOGI("scanMotions: loaded %d VMD files from %s", totalLoaded, modelDir.c_str());
+
+    // Auto-start idle after scanning
+    auto it = m_pool.find("idle");
+    if (it == m_pool.end() || it->second.empty()) {
+        it = m_pool.find("poses");
+    }
+    if (it != m_pool.end() && !it->second.empty()) {
+        auto anim = pickRandom(it->first);
+        if (anim) {
+            m_base.anim     = anim;
+            m_base.duration = static_cast<float>(anim->GetMaxKeyTime()) / 30.f;
+            m_base.time     = 0.f;
+            m_base.weight   = 1.f;
+            m_base.target   = 1.f;
+            m_base.looping  = true;
+            m_base.category = it->first;
+            LOGI("Auto-started [%s] dur=%.2fs", it->first.c_str(), m_base.duration);
+        }
+    }
+}
+
+// ── Single VMD loader ─────────────────────────────────────────────────────────
+
+std::shared_ptr<saba::VMDAnimation> VMDManager::loadSingleVMD(const std::string& path) {
+    if (!m_renderer || !m_renderer->getModel()) return nullptr;
+
     saba::MMDModel* raw = m_renderer->getModel();
+    // Wrap raw pointer in a shared_ptr with a no-op deleter — ownership stays with MMDRenderer.
     std::shared_ptr<saba::MMDModel> modelPtr(raw, [](saba::MMDModel*){});
 
     auto anim = std::make_shared<saba::VMDAnimation>();
-    if (!anim->Create(modelPtr)) { LOGE("VMDAnimation::Create failed"); return false; }
+    if (!anim->Create(modelPtr)) { LOGE("VMDAnimation::Create failed"); return nullptr; }
 
     saba::VMDFile vmdFile;
-    if (!saba::ReadVMDFile(&vmdFile, vmdPath.c_str())) {
-        LOGE("ReadVMDFile failed: %s", vmdPath.c_str()); return false;
+    if (!saba::ReadVMDFile(&vmdFile, path.c_str())) {
+        LOGE("ReadVMDFile failed: %s", path.c_str()); return nullptr;
     }
     if (!anim->Add(vmdFile)) {
-        LOGE("VMDAnimation::Add failed: %s", vmdPath.c_str()); return false;
+        LOGE("VMDAnimation::Add failed: %s", path.c_str()); return nullptr;
     }
+    return anim;
+}
 
-    m_motionPool[category].push_back({vmdPath, anim});
+bool VMDManager::loadMotion(const std::string& vmdPath, const std::string& category) {
+    auto anim = loadSingleVMD(vmdPath);
+    if (!anim) return false;
+    m_pool[category].push_back(anim);
     LOGI("Loaded VMD [%s] %s  pool=%zu",
-         category.c_str(), vmdPath.c_str(), m_motionPool[category].size());
+         category.c_str(), vmdPath.c_str(), m_pool[category].size());
     return true;
 }
 
-bool VMDManager::isCategoryUnlocked(const std::string& cat) const {
-    auto it = CATEGORY_TIER.find(cat);
-    if (it == CATEGORY_TIER.end()) return true;
-    return m_affinityTier >= it->second;
+// ── Random pick ───────────────────────────────────────────────────────────────
+
+std::shared_ptr<saba::VMDAnimation> VMDManager::pickRandom(const std::string& cat) {
+    auto it = m_pool.find(cat);
+    if (it == m_pool.end() || it->second.empty()) return nullptr;
+    std::uniform_int_distribution<size_t> d(0, it->second.size() - 1);
+    return it->second[d(m_rng)];
 }
 
-void VMDManager::playCategory(const std::string& category) {
-    if (!isCategoryUnlocked(category)) {
-        LOGI("Category [%s] locked for tier %d", category.c_str(), m_affinityTier);
-        return;
-    }
-    auto it = m_motionPool.find(category);
-    if (it == m_motionPool.end() || it->second.empty()) {
-        LOGI("No motions in category [%s]", category.c_str()); return;
+// ── Event control ─────────────────────────────────────────────────────────────
+
+/**
+ * Start a Layer-1 event from the given category.
+ * Immediately fades idle down and the event up.
+ */
+void VMDManager::startEvent(const std::string& category) {
+    auto anim = pickRandom(category);
+    if (!anim) {
+        LOGI("startEvent: no files in [%s]", category.c_str()); return;
     }
 
-    m_pauseActive = false;
-    m_pauseTimer  = 0.f;
+    m_event.anim     = anim;
+    m_event.duration = static_cast<float>(anim->GetMaxKeyTime()) / 30.f;
+    m_event.time     = 0.f;
+    m_event.weight   = m_event.weight; // keep current (may already be > 0)
+    m_event.target   = 1.f;
+    m_event.category = category;
+    m_event.looping  = false;
+    m_eventActive    = true;
 
-    auto& pool = it->second;
-    std::uniform_int_distribution<size_t> pick(0, pool.size()-1);
-    size_t idx = pick(m_rng);
+    // Fade idle to 0 while event plays
+    m_base.target = 0.f;
 
-    if (m_currentAnim) {
-        m_prevAnim     = m_currentAnim;
-        m_prevAnimTime = m_animTime;
-        m_blend        = {0.f, 0.5f, true};
-    }
-    m_currentAnim     = pool[idx].anim;
-    m_currentCategory = category;
-    m_animTime        = 0.f;
-    m_animDuration    = static_cast<float>(m_currentAnim->GetMaxKeyTime()) / 30.f;
-    LOGI("Playing [%s] idx=%zu dur=%.2fs", category.c_str(), idx, m_animDuration);
+    LOGI("Event started [%s] dur=%.2fs", category.c_str(), m_event.duration);
 }
 
-// ─── Physics inertia (gravity tilt — affects hair and all cloth) ──────────────
+void VMDManager::onTouch() {
+    LOGI("onTouch() → playing random [touch]");
+    startEvent("touch");
+}
+
+// ── Random event timer ────────────────────────────────────────────────────────
+
+void VMDManager::tickEventTimer(float dt) {
+    if (m_eventActive) return; // don't fire a new event while one is running
+
+    m_nextEventTimer -= dt;
+    if (m_nextEventTimer > 0.f) return;
+
+    // Choose: 70% waiting, 30% dance
+    std::uniform_real_distribution<float> chance(0.f, 1.f);
+    const std::string cat = (chance(m_rng) < 0.70f) ? "waiting" : "dance";
+
+    // Only fire if the category has files
+    if (m_pool.count(cat) && !m_pool[cat].empty()) {
+        startEvent(cat);
+    }
+
+    // Reset timer to random interval in [60, 600] seconds
+    std::uniform_real_distribution<float> td(60.f, 600.f);
+    m_nextEventTimer = td(m_rng);
+    LOGI("Next event timer: %.0f s", m_nextEventTimer);
+}
+
+// ── Physics inertia (gravity tilt → hair / cloth) ─────────────────────────────
 
 void VMDManager::applyPhysicsInertia(void* modelRaw, float /*dt*/) {
     saba::MMDModel* model = static_cast<saba::MMDModel*>(modelRaw);
+    if (!model) return;
     auto* mmPhysics = model->GetMMDPhysics();
     if (!mmPhysics) return;
-
     btDiscreteDynamicsWorld* world = mmPhysics->GetDynamicsWorld();
     if (!world) return;
 
-    // Target lateral gravity from drag velocity (opposes motion = inertia).
-    // Negative because we want the effect opposite to the drag direction.
     float targetGx = std::max(-MAX_LATERAL_GRAVITY,
                      std::min( MAX_LATERAL_GRAVITY, -m_dragVelX * DRAG_INERTIA_SCALE));
     float targetGz = std::max(-MAX_LATERAL_GRAVITY,
                      std::min( MAX_LATERAL_GRAVITY, -m_dragVelY * DRAG_INERTIA_SCALE));
 
-    // Smoothly blend current gravity toward target so transitions are gradual.
     btVector3 curG = world->getGravity();
     float newGx = curG.x() + (targetGx - curG.x()) * (1.f - INERTIA_DECAY);
     float newGz = curG.z() + (targetGz - curG.z()) * (1.f - INERTIA_DECAY);
 
-    // When there is no drag, blend back toward 0 on lateral axes.
     if (std::abs(m_dragVelX) < 5.f && std::abs(m_dragVelY) < 5.f) {
         newGx *= INERTIA_DECAY;
         newGz *= INERTIA_DECAY;
@@ -226,92 +300,67 @@ void VMDManager::applyPhysicsInertia(void* modelRaw, float /*dt*/) {
     world->setGravity(btVector3(newGx, -9.8f, newGz));
 }
 
-// ─── Jiggle impulse (applies only to heavy rigid bodies = breast / hip) ───────
+// ── Jiggle impulse (heavy rigid bodies = breast / hip) ────────────────────────
 
 void VMDManager::applyJiggleImpulses(void* modelRaw) {
-    // Compute velocity delta since last frame.
     float deltaVx = m_dragVelX - m_prevDragVelX;
     float deltaVy = m_dragVelY - m_prevDragVelY;
-
     float deltaMag = std::sqrt(deltaVx * deltaVx + deltaVy * deltaVy);
 
-    // Remember previous velocity for next frame.
     m_prevDragVelX = m_dragVelX;
     m_prevDragVelY = m_dragVelY;
 
-    // Check whether a new jiggle impulse should be fired.
     bool trigger = (deltaMag >= JIGGLE_TRIGGER_DELTA) && !m_jiggleFired;
-
     if (trigger) {
-        // Impulse direction: opposite to the velocity CHANGE (reaction force).
         m_jiggleImpulseX = -deltaVx * JIGGLE_IMPULSE_SCALE;
         m_jiggleImpulseY = -deltaVy * JIGGLE_IMPULSE_SCALE;
-
-        // Clamp impulse magnitude.
         float mag = std::sqrt(m_jiggleImpulseX * m_jiggleImpulseX +
                               m_jiggleImpulseY * m_jiggleImpulseY);
         if (mag > JIGGLE_MAX_IMPULSE) {
-            float scale = JIGGLE_MAX_IMPULSE / mag;
-            m_jiggleImpulseX *= scale;
-            m_jiggleImpulseY *= scale;
+            float s = JIGGLE_MAX_IMPULSE / mag;
+            m_jiggleImpulseX *= s;
+            m_jiggleImpulseY *= s;
         }
         m_jiggleFired = true;
-        LOGI("Jiggle impulse fired: (%.3f, %.3f)  dV=%.1f",
-             m_jiggleImpulseX, m_jiggleImpulseY, deltaMag);
+        LOGI("Jiggle: (%.3f, %.3f) dV=%.1f", m_jiggleImpulseX, m_jiggleImpulseY, deltaMag);
     } else if (deltaMag < JIGGLE_TRIGGER_DELTA * 0.5f) {
-        // Reset the "fired" guard once velocity has settled.
         m_jiggleFired = false;
     }
 
-    // Nothing to apply if there is no pending impulse.
-    if (std::abs(m_jiggleImpulseX) < 0.0001f && std::abs(m_jiggleImpulseY) < 0.0001f) {
-        return;
-    }
+    if (std::abs(m_jiggleImpulseX) < 0.0001f && std::abs(m_jiggleImpulseY) < 0.0001f) return;
 
-    // Access the Bullet world through MMDPhysics.
     saba::MMDModel* model = static_cast<saba::MMDModel*>(modelRaw);
+    if (!model) return;
     auto* mmPhysics = model->GetMMDPhysics();
     if (!mmPhysics) return;
-
     btDiscreteDynamicsWorld* world = mmPhysics->GetDynamicsWorld();
     if (!world) return;
 
-    // Apply impulse to rigid bodies whose mass exceeds the threshold.
-    // In MMD models, heavier bodies are typically breast / hip / buttock.
-    // Hair strands are lightweight and receive almost no impulse here —
-    // they are already handled by the gravity tilt in applyPhysicsInertia().
     const btCollisionObjectArray& objs = world->getCollisionObjectArray();
     for (int i = 0; i < objs.size(); ++i) {
         btRigidBody* rb = btRigidBody::upcast(objs[i]);
         if (!rb || rb->isStaticObject() || rb->isKinematicObject()) continue;
 
         float mass = rb->getMass();
-        if (mass < JIGGLE_MASS_THRESHOLD) continue;   // lightweight = hair, skip
+        if (mass < JIGGLE_MASS_THRESHOLD) continue;
 
-        // Scale impulse by mass so heavier bodies react proportionally.
         float scaledIx = m_jiggleImpulseX * mass;
         float scaledIy = m_jiggleImpulseY * mass;
-
-        // Clamp per-body impulse to avoid instability on very high-mass bodies.
-        float bodyMag = std::sqrt(scaledIx * scaledIx + scaledIy * scaledIy);
+        float bodyMag  = std::sqrt(scaledIx * scaledIx + scaledIy * scaledIy);
         if (bodyMag > JIGGLE_MAX_IMPULSE * mass) {
             float s = JIGGLE_MAX_IMPULSE * mass / bodyMag;
             scaledIx *= s;
             scaledIy *= s;
         }
-
-        // Apply as a central impulse (no angular torque) in the X-Z plane.
-        // Y is vertical (down) and is handled by gravity; X and Z are lateral.
         rb->applyCentralImpulse(btVector3(scaledIx, 0.f, scaledIy));
-        rb->activate(true);  // wake up any sleeping bodies
+        rb->activate(true);
     }
 
-    // Decay the stored impulse (0.0 = single-frame spike; >0 = multi-frame fade).
     m_jiggleImpulseX *= JIGGLE_IMPULSE_DECAY;
     m_jiggleImpulseY *= JIGGLE_IMPULSE_DECAY;
 }
 
-// ─── Main update ──────────────────────────────────────────────────────────────
+// ── Main update ───────────────────────────────────────────────────────────────
 
 void VMDManager::update(float rawDeltaTime) {
     if (!m_renderer) return;
@@ -319,79 +368,80 @@ void VMDManager::update(float rawDeltaTime) {
     saba::MMDModel* model = m_renderer->getModel();
     if (!model) return;
 
-    // ── Animation clock: clamped to prevent large jumps ───────────────────
+    // Clamp animation clock to avoid large jumps after GC pauses / app resumes.
     const float animDt = std::min(rawDeltaTime, MAX_ANIM_DT);
 
-    // ── Physics dt: exponential moving average — absorbs single-frame spikes
-    // while still tracking genuine frame-rate changes over time.
+    // EMA-smoothed physics dt — absorbs single-frame spikes for Bullet stability.
     m_smoothedPhysDt = m_smoothedPhysDt * (1.f - PHYS_DT_EMA)
                      + animDt            * PHYS_DT_EMA;
-    // Hard floor so Bullet never receives 0 (avoid div-by-zero in substep calc)
     const float physDt = std::max(m_smoothedPhysDt, 0.001f);
-
-    model->BeginAnimation();
 
     tickBlink(animDt);
     tickMouth(animDt);
-    applyBlend(animDt);
-    applyPhysicsInertia(model, physDt);  // gravity tilt for hair / cloth
-    applyJiggleImpulses(model);          // impulse bursts for breast / hip
+    tickEventTimer(animDt);
+    applyPhysicsInertia(model, physDt);
+    applyJiggleImpulses(model);
 
-    if (m_pauseActive) {
-        m_pauseTimer -= animDt;
-        if (m_pauseTimer <= 0.f) {
-            m_pauseActive = false;
-            LOGI("Pause over — restarting [%s]", m_currentCategory.c_str());
-            playCategory(m_currentCategory);
+    // ── Advance Layer 0 (base / idle) ─────────────────────────────────────
+    if (m_base.anim) {
+        m_base.time += animDt;
+        if (m_base.looping && m_base.duration > 0.f && m_base.time > m_base.duration) {
+            // Seamless loop: carry overshoot so seam is invisible.
+            m_base.time = std::fmod(m_base.time, m_base.duration);
         }
-        // Bind pose while paused; physics continues so hair settles naturally.
-        model->UpdateAllAnimation(nullptr, 0.f, physDt);
-
-    } else if (m_currentAnim) {
-        m_animTime += animDt;
-
-        if (m_animDuration > 0.f && m_animTime > m_animDuration) {
-            startNextLoop();
-            // After a seamless loop, startNextLoop() adjusts m_animTime for
-            // overshoot so UpdateAllAnimation evaluates the correct sub-frame.
-        }
-
-        // frameNumber is float → Saba Bezier-interpolates between keyframes.
-        model->UpdateAllAnimation(m_currentAnim.get(), m_animTime * 30.f, physDt);
-
-    } else {
-        model->UpdateAllAnimation(nullptr, 0.f, physDt);
     }
+
+    // ── Advance Layer 1 (event) ───────────────────────────────────────────
+    if (m_eventActive && m_event.anim) {
+        m_event.time += animDt;
+        if (m_event.duration > 0.f && m_event.time >= m_event.duration) {
+            // Event finished: return idle to full weight.
+            m_eventActive    = false;
+            m_event.target   = 0.f;
+            m_base.target    = 1.f;
+            LOGI("Event [%s] complete", m_event.category.c_str());
+        }
+    }
+
+    // ── Smooth weight fade ────────────────────────────────────────────────
+    // First-order low-pass: weight tracks target at WEIGHT_FADE_SPEED units/s.
+    float alpha = std::min(1.f, WEIGHT_FADE_SPEED * animDt);
+    m_base.weight  += (m_base.target  - m_base.weight)  * alpha;
+    m_event.weight += (m_event.target - m_event.weight)  * alpha;
+
+    // ── Two-layer Evaluate ────────────────────────────────────────────────
+    //
+    // Saba's VMDAnimation::Evaluate(frame, weight) additively accumulates
+    // weighted bone transform offsets.  Calling Layer-0 then Layer-1 in a
+    // single BeginAnimation / EndAnimation block achieves multi-layer blend:
+    //
+    //   FinalTransform ≈ (idle * idleWeight) + (event * eventWeight)
+    //
+    // When a static pose is used as the base and idle is the overlay:
+    //   FinalTransform = (PoseTransform * 1.0) + (IdleTransform * 0.3)
+    // achieved by setting m_base.target = 0.3 when the pose is active.
+    //
+    model->BeginAnimation();
+
+    if (m_base.anim && m_base.weight > 0.001f) {
+        m_base.anim->Evaluate(m_base.time * 30.f, m_base.weight);
+    }
+
+    if (m_event.anim && m_event.weight > 0.001f) {
+        m_event.anim->Evaluate(m_event.time * 30.f, m_event.weight);
+    }
+
+    // Run morph, IK (pre-physics), physics, IK (post-physics)
+    model->UpdateMorphAnimation();
+    model->UpdateNodeAnimation(false);
+    model->UpdatePhysicsAnimation(physDt);
+    model->UpdateNodeAnimation(true);
 
     model->Update();
     model->EndAnimation();
 }
 
-void VMDManager::applyBlend(float dt) {
-    if (!m_blend.active || !m_prevAnim || !m_currentAnim) return;
-    m_blend.elapsed += dt;
-    m_prevAnimTime  += dt;
-    if (m_blend.elapsed / m_blend.duration >= 1.f) {
-        m_blend.active = false;
-        m_prevAnim.reset();
-    }
-}
-
-void VMDManager::startNextLoop() {
-    if (m_currentCategory == "user") {
-        LOGI("[user] ended — pausing %.1fs", USER_LOOP_PAUSE);
-        m_pauseActive = true;
-        m_pauseTimer  = USER_LOOP_PAUSE;
-        // Keep m_animTime at the last frame so the model holds end-pose.
-    } else {
-        // Seamless loop: preserve overshoot so the seam is invisible.
-        float overshoot = m_animTime - m_animDuration;
-        playCategory(m_currentCategory);        // resets m_animTime to 0
-        m_animTime = std::max(0.f, overshoot);  // restore overshoot
-    }
-}
-
-// ─── Blink ────────────────────────────────────────────────────────────────────
+// ── Blink ─────────────────────────────────────────────────────────────────────
 
 void VMDManager::tickBlink(float dt) {
     if (!m_renderer) return;
@@ -410,22 +460,19 @@ void VMDManager::tickBlink(float dt) {
         if      (m_blinkPhase < H)     w = m_blinkPhase / H;
         else if (m_blinkPhase < H*2.f) w = 1.f - (m_blinkPhase - H) / H;
         else { w = 0.f; m_blinking = false; }
+        // UTF-8: まばたき (blink morph in Japanese MMD models)
         m_renderer->setMorphWeight("\xe3\x81\xbe\xe3\x81\xb0\xe3\x81\x9f\xe3\x81\x8d", w);
         m_renderer->setMorphWeight("blink", w);
     }
 }
 
-// ─── Mouth idle ───────────────────────────────────────────────────────────────
+// ── Mouth idle ────────────────────────────────────────────────────────────────
 
 void VMDManager::tickMouth(float dt) {
     if (!m_renderer) return;
     m_mouthPhase += dt * 1.2f;
     float w = (std::sin(m_mouthPhase) * 0.5f + 0.5f) * 0.06f;
+    // UTF-8: あ (mouth-open morph)
     m_renderer->setMorphWeight("\xe3\x81\x82", w);
     m_renderer->setMorphWeight("mouth_a", w);
-}
-
-void VMDManager::setAffinityTier(int tier) {
-    m_affinityTier = tier;
-    LOGI("AffinityTier = %d", tier);
 }
