@@ -17,6 +17,13 @@
  * (RENDERMODE_CONTINUOUSLY at the system refresh rate).  deltaTime is
  * clamped inside VMDManager to prevent large jumps.  Power-save mode is
  * handled by switching to RENDERMODE_WHEN_DIRTY at 30 fps from Java.
+ *
+ * SIGSEGV prevention
+ * ──────────────────
+ * g_destroyed is set to true by nativeDestroy() and checked at the start of
+ * every JNI call that touches GL or native objects.  This prevents
+ * use-after-free when the GL thread processes queued events after the EGL
+ * context has been torn down.
  */
 
 #include <jni.h>
@@ -38,6 +45,11 @@
 
 static std::unique_ptr<MMDRenderer> g_renderer;
 static std::unique_ptr<VMDManager>  g_vmdManager;
+
+// Set to true after nativeDestroy() — guards all subsequent JNI calls.
+// This prevents use-after-free on the GL thread when the EGL surface is
+// torn down before queued events have been drained.
+static std::atomic<bool> g_destroyed{false};
 
 // ─── Touch event queue (lock-free SPSC ring buffer) ──────────────────────────
 // type: 0=ACTION_DOWN, 1=ACTION_UP, 2=ACTION_MOVE
@@ -77,6 +89,7 @@ Java_com_endfield_overlayassistant_NativeRenderer_nativeInit(
         jint surfaceWidth, jint surfaceHeight)
 {
     LOGI("nativeInit  w=%d  h=%d", surfaceWidth, surfaceHeight);
+    g_destroyed.store(false, std::memory_order_release);
 
     if (!g_renderer)   g_renderer   = std::make_unique<MMDRenderer>();
     if (!g_vmdManager) g_vmdManager = std::make_unique<VMDManager>();
@@ -95,7 +108,7 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_com_endfield_overlayassistant_NativeRenderer_nativeLoadModel(
         JNIEnv* env, jobject /*thiz*/, jstring pmxPath)
 {
-    if (!g_renderer) return JNI_FALSE;
+    if (g_destroyed.load(std::memory_order_acquire) || !g_renderer) return JNI_FALSE;
     std::string path = jstring2str(env, pmxPath);
     LOGI("nativeLoadModel  path=%s", path.c_str());
     bool ok = g_renderer->loadPMXModel(path);
@@ -103,12 +116,27 @@ Java_com_endfield_overlayassistant_NativeRenderer_nativeLoadModel(
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
+/**
+ * Auto-scan modelDir/motions/{idle,poses,waiting,dance,touch} and load all VMD
+ * files.  Replaces the per-file nativeLoadMotion loop for new categories.
+ */
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_endfield_overlayassistant_NativeRenderer_nativeScanMotions(
+        JNIEnv* env, jobject /*thiz*/, jstring modelDir)
+{
+    if (g_destroyed.load(std::memory_order_acquire) || !g_vmdManager) return JNI_FALSE;
+    std::string dir = jstring2str(env, modelDir);
+    LOGI("nativeScanMotions  dir=%s", dir.c_str());
+    g_vmdManager->scanMotions(dir);
+    return JNI_TRUE;
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_endfield_overlayassistant_NativeRenderer_nativeLoadMotion(
         JNIEnv* env, jobject /*thiz*/,
         jstring vmdPath, jstring motionCategory)
 {
-    if (!g_vmdManager) return JNI_FALSE;
+    if (g_destroyed.load(std::memory_order_acquire) || !g_vmdManager) return JNI_FALSE;
     std::string path = jstring2str(env, vmdPath);
     std::string cat  = jstring2str(env, motionCategory);
     LOGI("nativeLoadMotion  path=%s  category=%s", path.c_str(), cat.c_str());
@@ -119,29 +147,39 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_endfield_overlayassistant_NativeRenderer_nativePlayMotionCategory(
         JNIEnv* env, jobject /*thiz*/, jstring motionCategory)
 {
-    if (!g_vmdManager) return;
-    std::string cat = jstring2str(env, motionCategory);
-    g_vmdManager->playCategory(cat);
+    // Kept for backward compatibility (night / user / friend categories from Java).
+    // New categories (idle, waiting, dance, touch) are managed internally.
+    if (g_destroyed.load(std::memory_order_acquire) || !g_vmdManager) return;
+    // No-op: internal timer and layer system now handles all playback decisions.
+    (void)motionCategory;
+}
+
+/**
+ * Priority-interrupt: immediately plays a random "touch" animation on Layer 1.
+ * Called from Java when the user headpats / taps the model.
+ */
+extern "C" JNIEXPORT void JNICALL
+Java_com_endfield_overlayassistant_NativeRenderer_nativeOnTouch(
+        JNIEnv* /*env*/, jobject /*thiz*/)
+{
+    if (g_destroyed.load(std::memory_order_acquire) || !g_vmdManager) return;
+    g_vmdManager->onTouch();
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_endfield_overlayassistant_NativeRenderer_nativeRender(
         JNIEnv* /*env*/, jobject /*thiz*/)
 {
+    // Guard: don't render after nativeDestroy().
+    if (g_destroyed.load(std::memory_order_acquire)) return;
     if (!g_renderer) return;
 
-    // Compute actual elapsed time since the last frame.
-    // We do NOT skip frames based on a target FPS — GLSurfaceView already
-    // calls onDrawFrame at the display's vsync rate.  Skipping frames here
-    // caused an irregular timing pattern that made animation look jerky.
     auto   now     = Clock::now();
     double elapsed = std::chrono::duration<double>(now - g_lastFrame).count();
     g_lastFrame    = now;
 
-    // Safety clamp: don't let a huge spike (e.g. app resume after 5 s in
-    // background) pass a gigantic dt into the physics engine.
-    // VMDManager clamps again internally, but this keeps the value sane here.
-    float dt = static_cast<float>(std::min(elapsed, 0.25));  // max 250 ms
+    // Safety clamp before handing to VMDManager (which clamps again internally).
+    float dt = static_cast<float>(std::min(elapsed, 0.25));
 
     // ── Process queued touch events on the GL thread ──────────────────────
     size_t head = g_touchHead.load(std::memory_order_acquire);
@@ -160,7 +198,7 @@ Java_com_endfield_overlayassistant_NativeRenderer_nativeRender(
         head = g_touchHead.load(std::memory_order_acquire);
     }
 
-    // Pass current drag velocity to VMDManager so it can tilt physics gravity.
+    // Pass drag velocity to VMDManager for physics inertia / jiggle.
     if (g_vmdManager && g_renderer) {
         g_vmdManager->setDragVelocity(g_renderer->getDragVelX(),
                                       g_renderer->getDragVelY());
@@ -174,6 +212,7 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_endfield_overlayassistant_NativeRenderer_nativeSurfaceChanged(
         JNIEnv* /*env*/, jobject /*thiz*/, jint width, jint height)
 {
+    if (g_destroyed.load(std::memory_order_acquire)) return;
     if (g_renderer) g_renderer->onSurfaceChanged(width, height);
 }
 
@@ -189,6 +228,7 @@ Java_com_endfield_overlayassistant_NativeRenderer_nativeSetTransform(
         JNIEnv* /*env*/, jobject /*thiz*/,
         jfloat x, jfloat y, jfloat scale, jfloat alpha)
 {
+    if (g_destroyed.load(std::memory_order_acquire)) return;
     if (g_renderer) g_renderer->setTransform(x, y, scale, alpha);
 }
 
@@ -196,9 +236,6 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_endfield_overlayassistant_NativeRenderer_nativeSetPowerSave(
         JNIEnv* /*env*/, jobject /*thiz*/, jboolean enabled)
 {
-    // Power-save mode should be handled on the Java side by switching
-    // GLSurfaceView to RENDERMODE_WHEN_DIRTY at 30 fps.
-    // Log it here so the Java layer can react if needed.
     LOGI("PowerSave %s", (enabled == JNI_TRUE) ? "ON" : "OFF");
 }
 
@@ -206,15 +243,31 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_endfield_overlayassistant_NativeRenderer_nativeSetAffinityTier(
         JNIEnv* /*env*/, jobject /*thiz*/, jint tier)
 {
+    if (g_destroyed.load(std::memory_order_acquire)) return;
     if (g_vmdManager) g_vmdManager->setAffinityTier(tier);
     LOGI("AffinityTier set to %d", tier);
 }
 
+/**
+ * nativeDestroy — called from the GL thread via queueEvent in onDetachedFromWindow.
+ *
+ * CRITICAL: Java-side OverlayView MUST wait for this call to complete (via
+ * CountDownLatch) before calling GLSurfaceView.onPause(), which destroys the
+ * EGL surface.  Without this synchronisation, the Adreno gralloc driver can
+ * crash with SIGSEGV (SEGV_ACCERR) inside ReleaseBuffer while the GL thread
+ * is still flushing commands.
+ */
 extern "C" JNIEXPORT void JNICALL
 Java_com_endfield_overlayassistant_NativeRenderer_nativeDestroy(
         JNIEnv* /*env*/, jobject /*thiz*/)
 {
     LOGI("nativeDestroy");
+
+    // Signal all other JNI calls to bail out immediately.
+    g_destroyed.store(true, std::memory_order_release);
+
     if (g_vmdManager) g_vmdManager.reset();
     if (g_renderer)   { g_renderer->shutdown(); g_renderer.reset(); }
+
+    LOGI("nativeDestroy complete");
 }
