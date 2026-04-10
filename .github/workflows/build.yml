@@ -50,14 +50,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      # ── 5. Download gradle-wrapper.jar (binary; not committed to VCS) ────
+      # ── 5. Download gradle-wrapper.jar ───────────────────────────────────
       - name: Download gradle-wrapper.jar
         run: |
           mkdir -p gradle/wrapper
           curl -fsSL \
             "https://github.com/gradle/gradle/raw/v8.6.0/gradle/wrapper/gradle-wrapper.jar" \
             -o gradle/wrapper/gradle-wrapper.jar
-          ls -lh gradle/wrapper/
 
       # ── 6. Verify saba submodule was cloned ──────────────────────────────
       - name: Verify saba submodule
@@ -66,40 +65,54 @@ jobs:
             echo "ERROR: saba submodule not found. Attempting manual init..."
             git submodule update --init --recursive app/src/main/cpp/saba
           fi
-          echo "saba submodule OK:"
-          ls app/src/main/cpp/saba/
+          echo "saba submodule OK"
 
       # ── 7. Make gradlew executable ───────────────────────────────────────
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      # ── 8. Build ─────────────────────────────────────────────────────────
-      - name: Build Debug APK
+      # ── 8. Создать debug keystore (если ещё нет) ─────────────────────────
+      - name: Generate debug keystore
         run: |
-          ./gradlew assembleDebug \
+          mkdir -p ~/.android
+          keytool -genkeypair -v \
+            -keystore ~/.android/debug.keystore \
+            -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android \
+            -dname "CN=Android Debug,O=Android,C=US" 2>/dev/null || true
+
+      # ── 9. Release-сборка с R8/ProGuard обфускацией ──────────────────────
+      - name: Build Release APK (с обфускацией)
+        run: |
+          ./gradlew assembleRelease \
             -Pandroid.ndkVersion=26.1.10909125 \
+            -Pandroid.injected.signing.store.file=$HOME/.android/debug.keystore \
+            -Pandroid.injected.signing.store.password=android \
+            -Pandroid.injected.signing.key.alias=androiddebugkey \
+            -Pandroid.injected.signing.key.password=android \
             --stacktrace \
             --no-daemon
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
 
-      # ── 9. Verify APK was produced ───────────────────────────────────────
+      # ── 10. Verify APK was produced ──────────────────────────────────────
       - name: Verify APK exists
         run: |
-          APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
+          APK_PATH="app/build/outputs/apk/release/app-release.apk"
           if [ ! -f "$APK_PATH" ]; then
             echo "ERROR: APK not found at $APK_PATH"
             find app/build/outputs -name "*.apk" 2>/dev/null || echo "No APKs found"
             exit 1
           fi
           APK_SIZE=$(du -h "$APK_PATH" | cut -f1)
-          echo "APK built successfully: $APK_PATH ($APK_SIZE)"
+          echo "Release APK built successfully: $APK_PATH ($APK_SIZE)"
 
-      # ── 9. Upload APK artifact ───────────────────────────────────────────
-      - name: Upload Debug APK
+      # ── 11. Upload Release APK ────────────────────────────────────────────
+      - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug-${{ github.sha }}
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: app-release-${{ github.sha }}
+          path: app/build/outputs/apk/release/app-release.apk
           retention-days: 14
           if-no-files-found: error
