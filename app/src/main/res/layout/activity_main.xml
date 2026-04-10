@@ -2,7 +2,7 @@
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#1A1A2E"
+    android:background="#000000"
     android:fillViewport="true">
 
     <LinearLayout
@@ -11,135 +11,161 @@
         android:orientation="vertical"
         android:padding="24dp">
 
+        <!-- ── Title ─────────────────────────────────────────────── -->
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="@string/app_name"
-            android:textSize="28sp"
-            android:textColor="#E8B4B8"
+            android:textSize="30sp"
+            android:textColor="#00FF41"
             android:textStyle="bold"
+            android:fontFamily="monospace"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginTop="8dp"
+            android:layout_marginBottom="4dp" />
+
+        <!-- Neon underline bar -->
+        <View
+            android:layout_width="180dp"
+            android:layout_height="1dp"
+            android:background="#00FF41"
             android:layout_gravity="center_horizontal"
             android:layout_marginBottom="8dp" />
 
+        <!-- ── Affinity ──────────────────────────────────────────── -->
         <TextView
             android:id="@+id/tv_affinity"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:textSize="14sp"
-            android:textColor="#AAAACC"
+            android:textSize="13sp"
+            android:textColor="#66FF41"
+            android:fontFamily="monospace"
             android:gravity="center"
-            android:layout_marginBottom="24dp"
+            android:layout_marginBottom="28dp"
             android:text="@string/affinity_loading" />
 
+        <!-- ── PERMISSIONS section label ─────────────────────────── -->
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="@string/section_permissions"
-            android:textSize="12sp"
-            android:textColor="#6666AA"
+            android:textSize="11sp"
+            android:textColor="#00FF41"
             android:textAllCaps="true"
-            android:letterSpacing="0.12"
+            android:fontFamily="monospace"
+            android:letterSpacing="0.18"
             android:layout_marginBottom="8dp" />
 
-        <androidx.cardview.widget.CardView
-            xmlns:app="http://schemas.android.com/apk/res-auto"
+        <!-- ── Permissions card ──────────────────────────────────── -->
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            app:cardBackgroundColor="#252540"
-            app:cardCornerRadius="12dp"
-            android:layout_marginBottom="16dp">
+            android:orientation="vertical"
+            android:background="@drawable/card_neon"
+            android:padding="16dp"
+            android:layout_marginBottom="20dp">
 
+            <!-- Draw over other apps -->
             <LinearLayout
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:orientation="vertical"
-                android:padding="16dp">
+                android:layout_height="52dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
 
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="48dp"
-                    android:orientation="horizontal"
-                    android:gravity="center_vertical">
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/perm_overlay"
+                    android:textColor="#FFFFFF"
+                    android:textSize="15sp" />
 
-                    <TextView
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:text="@string/perm_overlay"
-                        android:textColor="#FFFFFF"
-                        android:textSize="15sp" />
-
-                    <Switch
-                        android:id="@+id/switch_overlay_perm"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content" />
-                </LinearLayout>
-
-                <View android:layout_width="match_parent"
-                    android:layout_height="1dp"
-                    android:background="#33FFFFFF" />
-
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="48dp"
-                    android:orientation="horizontal"
-                    android:gravity="center_vertical">
-
-                    <TextView
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:text="@string/perm_notifications"
-                        android:textColor="#FFFFFF"
-                        android:textSize="15sp" />
-
-                    <Switch
-                        android:id="@+id/switch_notif_perm"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content" />
-                </LinearLayout>
+                <Switch
+                    android:id="@+id/switch_overlay_perm"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content" />
             </LinearLayout>
-        </androidx.cardview.widget.CardView>
 
+            <!-- Divider -->
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:background="#1A00FF41" />
+
+            <!-- Notifications -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="52dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/perm_notifications"
+                    android:textColor="#FFFFFF"
+                    android:textSize="15sp" />
+
+                <Switch
+                    android:id="@+id/switch_notif_perm"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- ── CHARACTER MODEL section label ────────────────────── -->
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="@string/section_character"
-            android:textSize="12sp"
-            android:textColor="#6666AA"
+            android:textSize="11sp"
+            android:textColor="#00FF41"
             android:textAllCaps="true"
-            android:letterSpacing="0.12"
+            android:fontFamily="monospace"
+            android:letterSpacing="0.18"
             android:layout_marginBottom="8dp" />
 
+        <!-- ── Model name field ──────────────────────────────────── -->
         <TextView
             android:id="@+id/tv_char_selected"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="@string/scanning_models"
-            android:textColor="#CCCCFF"
+            android:textColor="#00FF41"
             android:textSize="14sp"
+            android:fontFamily="monospace"
             android:padding="16dp"
-            android:background="#252540"
-            android:layout_marginBottom="16dp" />
+            android:background="@drawable/char_field_neon"
+            android:layout_marginBottom="28dp" />
 
+        <!-- ── START / STOP primary button ──────────────────────── -->
         <Button
             android:id="@+id/btn_start_stop"
             android:layout_width="match_parent"
             android:layout_height="56dp"
             android:text="@string/btn_start"
-            android:textSize="16sp"
-            android:backgroundTint="#E8B4B8"
-            android:textColor="#1A1A2E"
+            android:textSize="15sp"
+            android:textStyle="bold"
+            android:textAllCaps="true"
+            android:fontFamily="monospace"
+            android:letterSpacing="0.12"
+            android:background="@drawable/btn_neon_primary"
+            android:textColor="#000000"
             android:layout_marginBottom="12dp" />
 
+        <!-- ── SETTINGS secondary button ─────────────────────────── -->
         <Button
             android:id="@+id/btn_settings"
             android:layout_width="match_parent"
             android:layout_height="48dp"
             android:text="@string/btn_settings"
-            android:textSize="14sp"
-            android:backgroundTint="#252540"
-            android:textColor="#CCCCFF" />
+            android:textSize="13sp"
+            android:textAllCaps="true"
+            android:fontFamily="monospace"
+            android:letterSpacing="0.12"
+            android:background="@drawable/btn_neon_secondary"
+            android:textColor="#00FF41" />
 
     </LinearLayout>
 </ScrollView>

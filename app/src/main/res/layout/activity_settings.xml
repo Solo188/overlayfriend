@@ -2,7 +2,8 @@
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#1A1A2E">
+    android:background="#000000"
+    android:fillViewport="true">
 
     <LinearLayout
         android:layout_width="match_parent"
@@ -10,104 +11,155 @@
         android:orientation="vertical"
         android:padding="24dp">
 
+        <!-- ── Title ─────────────────────────────────────────────── -->
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="@string/settings_title"
-            android:textSize="22sp"
-            android:textColor="#E8B4B8"
+            android:textSize="24sp"
+            android:textColor="#00FF41"
             android:textStyle="bold"
-            android:layout_marginBottom="24dp" />
-
-        <TextView android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="@string/label_scale"
-            android:textColor="#AAAACC"
-            android:textSize="13sp"
+            android:fontFamily="monospace"
             android:layout_marginBottom="4dp" />
 
-        <LinearLayout android:layout_width="match_parent"
+        <!-- Neon underline -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#00FF41"
+            android:layout_marginBottom="28dp" />
+
+        <!-- ── Scale label ───────────────────────────────────────── -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/label_scale"
+            android:textColor="#66FF80"
+            android:fontFamily="monospace"
+            android:textSize="12sp"
+            android:textAllCaps="true"
+            android:letterSpacing="0.08"
+            android:layout_marginBottom="8dp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
             android:gravity="center_vertical"
-            android:layout_marginBottom="24dp">
+            android:layout_marginBottom="28dp">
 
-            <SeekBar android:id="@+id/seekbar_scale"
+            <SeekBar
+                android:id="@+id/seekbar_scale"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:progressTint="#E8B4B8"
-                android:thumbTint="#E8B4B8" />
+                android:progressTint="#00FF41"
+                android:thumbTint="#00FF41"
+                android:progressBackgroundTint="#1A331A" />
 
-            <TextView android:id="@+id/tv_scale_value"
+            <TextView
+                android:id="@+id/tv_scale_value"
                 android:layout_width="60dp"
                 android:layout_height="wrap_content"
-                android:textColor="#FFFFFF"
+                android:textColor="#00FF41"
+                android:fontFamily="monospace"
                 android:textSize="14sp"
                 android:gravity="end"
                 android:text="1.00x" />
         </LinearLayout>
 
-        <TextView android:layout_width="match_parent"
+        <!-- ── Opacity label ─────────────────────────────────────── -->
+        <TextView
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="@string/label_opacity"
-            android:textColor="#AAAACC"
-            android:textSize="13sp"
-            android:layout_marginBottom="4dp" />
+            android:textColor="#66FF80"
+            android:fontFamily="monospace"
+            android:textSize="12sp"
+            android:textAllCaps="true"
+            android:letterSpacing="0.08"
+            android:layout_marginBottom="8dp" />
 
-        <LinearLayout android:layout_width="match_parent"
+        <LinearLayout
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
             android:gravity="center_vertical"
-            android:layout_marginBottom="24dp">
+            android:layout_marginBottom="32dp">
 
-            <SeekBar android:id="@+id/seekbar_opacity"
+            <SeekBar
+                android:id="@+id/seekbar_opacity"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:progressTint="#E8B4B8"
-                android:thumbTint="#E8B4B8" />
+                android:progressTint="#00FF41"
+                android:thumbTint="#00FF41"
+                android:progressBackgroundTint="#1A331A" />
 
-            <TextView android:id="@+id/tv_opacity_value"
+            <TextView
+                android:id="@+id/tv_opacity_value"
                 android:layout_width="60dp"
                 android:layout_height="wrap_content"
-                android:textColor="#FFFFFF"
+                android:textColor="#00FF41"
+                android:fontFamily="monospace"
                 android:textSize="14sp"
                 android:gravity="end"
                 android:text="100%" />
         </LinearLayout>
 
-        <LinearLayout android:layout_width="match_parent"
+        <!-- ── Divider ───────────────────────────────────────────── -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#1A00FF41"
+            android:layout_marginBottom="8dp" />
+
+        <!-- ── Silent Mode toggle ────────────────────────────────── -->
+        <LinearLayout
+            android:layout_width="match_parent"
             android:layout_height="56dp"
             android:orientation="horizontal"
             android:gravity="center_vertical"
-            android:layout_marginBottom="8dp">
+            android:layout_marginBottom="4dp">
 
-            <TextView android:layout_width="0dp"
+            <TextView
+                android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
                 android:text="@string/label_silent_mode"
-                android:textColor="#FFFFFF"
+                android:textColor="#CCFFD9"
                 android:textSize="15sp" />
 
-            <Switch android:id="@+id/switch_silent"
+            <Switch
+                android:id="@+id/switch_silent"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content" />
         </LinearLayout>
 
-        <LinearLayout android:layout_width="match_parent"
+        <!-- Divider -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#1A00FF41"
+            android:layout_marginBottom="8dp" />
+
+        <!-- ── Position Lock toggle ──────────────────────────────── -->
+        <LinearLayout
+            android:layout_width="match_parent"
             android:layout_height="56dp"
             android:orientation="horizontal"
             android:gravity="center_vertical">
 
-            <TextView android:layout_width="0dp"
+            <TextView
+                android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
                 android:text="@string/label_position_lock"
-                android:textColor="#FFFFFF"
+                android:textColor="#CCFFD9"
                 android:textSize="15sp" />
 
-            <Switch android:id="@+id/switch_pos_lock"
+            <Switch
+                android:id="@+id/switch_pos_lock"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content" />
         </LinearLayout>
