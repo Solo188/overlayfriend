@@ -63,8 +63,7 @@ public class MainActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Проверка целостности — должна быть первой
-        IntegrityGuard.verify(this);
+        
 
         setContentView(R.layout.activity_main);
 
