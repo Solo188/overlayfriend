@@ -27,6 +27,7 @@ public class MainActivity extends AppCompatActivity {
     private Switch   m_switchNotifs;
     private Button   m_btnStartStop;
     private Button   m_btnSettings;
+    private Button   m_btnCreator;
     private TextView m_tvAffinity;
     private TextView m_tvCharSelected;
 
@@ -87,6 +88,7 @@ public class MainActivity extends AppCompatActivity {
         m_switchNotifs   = findViewById(R.id.switch_notif_perm);
         m_btnStartStop   = findViewById(R.id.btn_start_stop);
         m_btnSettings    = findViewById(R.id.btn_settings);
+        m_btnCreator     = findViewById(R.id.btn_creator);
         m_tvAffinity     = findViewById(R.id.tv_affinity);
         m_tvCharSelected = findViewById(R.id.tv_char_selected);
     }
@@ -114,6 +116,12 @@ public class MainActivity extends AppCompatActivity {
         m_btnSettings.setOnClickListener(v ->
             startActivity(new Intent(this,
                 com.endfield.overlayassistant.settings.SettingsActivity.class)));
+
+        m_btnCreator.setOnClickListener(v -> {
+            Intent browserIntent = new Intent(Intent.ACTION_VIEW,
+                Uri.parse("https://t.me/TheForgottenHarlequin9"));
+            startActivity(browserIntent);
+        });
     }
 
     /**
