@@ -62,6 +62,10 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        // Проверка целостности — должна быть первой
+        IntegrityGuard.verify(this);
+
         setContentView(R.layout.activity_main);
 
         m_affinity = new AffinityManager(this);
@@ -119,7 +123,7 @@ public class MainActivity extends AppCompatActivity {
 
         m_btnCreator.setOnClickListener(v -> {
             Intent browserIntent = new Intent(Intent.ACTION_VIEW,
-                Uri.parse("https://t.me/TheForgottenHarlequin9"));
+                Uri.parse(IntegrityGuard.getCreatorUrl()));
             startActivity(browserIntent);
         });
     }
