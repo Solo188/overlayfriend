@@ -31,7 +31,7 @@ public final class IntegrityGuard {
     // Шаг 1: соберите APK, запустите и посмотрите logcat тег CERT_HASH.
     // Шаг 2: вставьте полученный хэш сюда и пересоберите.
     // Пока поле пустое — проверка подписи пропускается.
-    private static final String EXPECTED_CERT_HASH = "";
+    private static final String EXPECTED_CERT_HASH = "7EF124FD75F80AC86434D8D44958A08A60AF8873A6C461D2AFC5F13E43B8C898";
 
     private IntegrityGuard() {}
 
