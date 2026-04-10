@@ -32,7 +32,7 @@ public final class IntegrityGuard {
     // Шаг 1: соберите APK и запустите — появится диалог с хэшем.
     // Шаг 2: вставьте хэш сюда и пересоберите.
     // Пока поле пустое — показывается диалог с хэшем (режим настройки).
-    private static final String EXPECTED_CERT_HASH = "78fec25a17c4c9b20a231473ec24e316f0d674c80b3bb0b0beefbe521f7a206f";
+    private static final String EXPECTED_CERT_HASH = "";
 
     private IntegrityGuard() {}
 
