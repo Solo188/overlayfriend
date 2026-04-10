@@ -165,7 +165,26 @@
             android:fontFamily="monospace"
             android:letterSpacing="0.12"
             android:background="@drawable/btn_neon_secondary"
-            android:textColor="#00FF41" />
+            android:textColor="#00FF41"
+            android:layout_marginBottom="24dp" />
+
+        <!-- ── CREATOR link button ────────────────────────────────── -->
+        <Button
+            android:id="@+id/btn_creator"
+            android:layout_width="wrap_content"
+            android:layout_height="36dp"
+            android:text="@string/btn_creator"
+            android:textSize="11sp"
+            android:textAllCaps="false"
+            android:fontFamily="monospace"
+            android:letterSpacing="0.08"
+            android:background="@android:color/transparent"
+            android:textColor="#66FF41"
+            android:layout_gravity="center_horizontal"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
+            android:paddingStart="16dp"
+            android:paddingEnd="16dp" />
 
     </LinearLayout>
 </ScrollView>
