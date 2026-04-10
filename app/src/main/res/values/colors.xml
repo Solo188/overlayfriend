@@ -1,4 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="ic_launcher_background">#1A1A2E</color>
+    <!-- Background layers -->
+    <color name="neon_bg">#000000</color>
+    <color name="neon_surface">#090E09</color>
+    <color name="neon_card">#0A100A</color>
+
+    <!-- Neon green palette -->
+    <color name="neon_green">#00FF41</color>
+    <color name="neon_green_dim">#00CC33</color>
+    <color name="neon_green_faint">#1A331A</color>
+    <color name="neon_green_alpha30">#4D00FF41</color>
+    <color name="neon_divider">#2200FF41</color>
+
+    <!-- Text -->
+    <color name="neon_text_primary">#FFFFFF</color>
+    <color name="neon_text_secondary">#99FFFFFF</color>
+    <color name="neon_text_accent">#00FF41</color>
+
+    <!-- Legacy (launcher icon) -->
+    <color name="ic_launcher_background">#000000</color>
 </resources>
