@@ -1,10 +1,14 @@
 package com.endfield.overlayassistant;
 
+import android.app.AlertDialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.Signature;
 import android.os.Process;
+import android.widget.Toast;
 
 import java.security.MessageDigest;
 
@@ -15,23 +19,20 @@ import java.security.MessageDigest;
  *  1. Имя пакета — не изменено ли
  *  2. SHA-256 подписи APK — подписано ли оригинальным ключом
  *
- * Если проверка не проходит — процесс завершается.
- *
  * ПОСЛЕ ПЕРВОЙ СБОРКИ:
- *   Запустите приложение, оно выведет в logcat свой хэш:
- *   adb logcat | grep "CERT_HASH"
- *   Скопируйте полученный хэш в EXPECTED_CERT_HASH ниже и пересоберите.
+ *   Запустите приложение — на экране появится диалог с хэшем.
+ *   Скопируйте хэш в EXPECTED_CERT_HASH ниже и пересоберите.
  */
 public final class IntegrityGuard {
 
     // Ожидаемое имя пакета — не менять
     private static final String EXPECTED_PACKAGE = "com.endfield.overlayassistant";
 
-    // SHA-256 подписи вашего APK (в нижнем регистре без пробелов).
-    // Шаг 1: соберите APK, запустите и посмотрите logcat тег CERT_HASH.
-    // Шаг 2: вставьте полученный хэш сюда и пересоберите.
-    // Пока поле пустое — проверка подписи пропускается.
-    private static final String EXPECTED_CERT_HASH = "7EF124FD75F80AC86434D8D44958A08A60AF8873A6C461D2AFC5F13E43B8C898";
+    // SHA-256 подписи вашего APK.
+    // Шаг 1: соберите APK и запустите — появится диалог с хэшем.
+    // Шаг 2: вставьте хэш сюда и пересоберите.
+    // Пока поле пустое — показывается диалог с хэшем (режим настройки).
+    private static final String EXPECTED_CERT_HASH = "";
 
     private IntegrityGuard() {}
 
@@ -46,7 +47,6 @@ public final class IntegrityGuard {
 
     // ── Зашифрованная ссылка на разработчика ─────────────────────────────────
     // URL хранится в XOR-виде, чтобы не светиться в строках DEX.
-    // Ключ: 0x5A
     private static final byte[] CREATOR_URL_XOR = {
         0x32,0x2E,0x2E,0x2A,0x29,0x60,0x75,0x75,
         0x2E,0x74,0x37,0x3F,0x75,0x0E,0x32,0x3F,
@@ -68,27 +68,42 @@ public final class IntegrityGuard {
     // ── Внутренние методы ─────────────────────────────────────────────────────
 
     private static void checkPackageName(Context ctx) {
-        String actual = ctx.getPackageName();
-        if (!EXPECTED_PACKAGE.equals(actual)) {
+        if (!EXPECTED_PACKAGE.equals(ctx.getPackageName())) {
             die();
         }
     }
 
     @SuppressWarnings("deprecation")
     private static void checkSignature(Context ctx) {
+        String hash = getCertHash(ctx);
+
         if (EXPECTED_CERT_HASH.isEmpty()) {
-            // Режим первого запуска — просто выводим хэш в logcat
-            String hash = getCertHash(ctx);
-            if (hash != null) {
-                android.util.Log.i("CERT_HASH", "Вставьте этот хэш в EXPECTED_CERT_HASH: " + hash);
-            }
+            // Режим настройки — показать хэш на экране в диалоге
+            showHashDialog(ctx, hash != null ? hash : "Ошибка получения хэша");
             return;
         }
 
-        String actual = getCertHash(ctx);
-        if (!EXPECTED_CERT_HASH.equals(actual)) {
+        if (!EXPECTED_CERT_HASH.equals(hash)) {
             die();
         }
+    }
+
+    /** Показывает диалог с хэшем и кнопкой "Скопировать" */
+    private static void showHashDialog(Context ctx, String hash) {
+        new AlertDialog.Builder(ctx)
+            .setTitle("Режим настройки подписи")
+            .setMessage(
+                "Скопируйте этот хэш и вставьте его в EXPECTED_CERT_HASH в IntegrityGuard.java, затем пересоберите APK:\n\n" + hash
+            )
+            .setPositiveButton("Скопировать", (d, w) -> {
+                ClipboardManager cm = (ClipboardManager)
+                    ctx.getSystemService(Context.CLIPBOARD_SERVICE);
+                cm.setPrimaryClip(ClipData.newPlainText("cert_hash", hash));
+                Toast.makeText(ctx, "Хэш скопирован!", Toast.LENGTH_SHORT).show();
+            })
+            .setNegativeButton("Закрыть", null)
+            .setCancelable(false)
+            .show();
     }
 
     @SuppressWarnings("deprecation")
