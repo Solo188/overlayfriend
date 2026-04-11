@@ -81,7 +81,7 @@ static constexpr float JIGGLE_TRIGGER_DELTA  = 50.f;
 static constexpr float JIGGLE_MASS_THRESHOLD = 0.3f;
 static constexpr float JIGGLE_IMPULSE_SCALE  = 0.035f;
 static constexpr float JIGGLE_MAX_IMPULSE    = 8.0f;
-static constexpr float JIGGLE_IMPULSE_DECAY  = 0.0f;
+static constexpr float JIGGLE_IMPULSE_DECAY  = 0.85f;
 
 // ── Constructor / Destructor ──────────────────────────────────────────────────
 
@@ -283,21 +283,24 @@ void VMDManager::applyPhysicsInertia(void* modelRaw, float /*dt*/) {
     btDiscreteDynamicsWorld* world = mmPhysics->GetDynamicsWorld();
     if (!world) return;
 
+    // X-axis tilt: horizontal screen drag → lateral gravity
     float targetGx = std::max(-MAX_LATERAL_GRAVITY,
                      std::min( MAX_LATERAL_GRAVITY, -m_dragVelX * DRAG_INERTIA_SCALE));
-    float targetGz = std::max(-MAX_LATERAL_GRAVITY,
+    // Y-axis inertia: vertical screen drag → up/down gravity offset (jump/fall effect)
+    // Previously mapped to Z (into screen) — wrong for Y-up MMD coordinate system.
+    float targetGy = std::max(-MAX_LATERAL_GRAVITY,
                      std::min( MAX_LATERAL_GRAVITY, -m_dragVelY * DRAG_INERTIA_SCALE));
 
     btVector3 curG = world->getGravity();
     float newGx = curG.x() + (targetGx - curG.x()) * (1.f - INERTIA_DECAY);
-    float newGz = curG.z() + (targetGz - curG.z()) * (1.f - INERTIA_DECAY);
+    float newGy = curG.y() + ((-9.8f + targetGy) - curG.y()) * (1.f - INERTIA_DECAY);
 
     if (std::abs(m_dragVelX) < 5.f && std::abs(m_dragVelY) < 5.f) {
         newGx *= INERTIA_DECAY;
-        newGz *= INERTIA_DECAY;
+        newGy  = curG.y() + (-9.8f - curG.y()) * (1.f - INERTIA_DECAY);
     }
 
-    world->setGravity(btVector3(newGx, -9.8f, newGz));
+    world->setGravity(btVector3(newGx, newGy, 0.f));
 }
 
 // ── Jiggle impulse (heavy rigid bodies = breast / hip) ────────────────────────
@@ -374,7 +377,8 @@ void VMDManager::update(float rawDeltaTime) {
     // EMA-smoothed physics dt — absorbs single-frame spikes for Bullet stability.
     m_smoothedPhysDt = m_smoothedPhysDt * (1.f - PHYS_DT_EMA)
                      + animDt            * PHYS_DT_EMA;
-    const float physDt = std::max(m_smoothedPhysDt, 0.001f);
+    // Clamp physDt to max 1/60 s — prevents physics "explosions" on frame drops.
+    const float physDt = std::max(std::min(m_smoothedPhysDt, 1.f / 60.f), 0.001f);
 
     tickBlink(animDt);
     tickMouth(animDt);
