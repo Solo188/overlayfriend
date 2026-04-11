@@ -108,7 +108,7 @@ static constexpr float JIGGLE_MAX_IMPULSE    = 5.0f;
 static constexpr float JIGGLE_IMPULSE_DECAY  = 0.88f;
 static constexpr float LINEAR_DAMPING        = 0.95f;
 static constexpr float ANGULAR_DAMPING       = 0.95f;
-static constexpr float MAX_VELOCITY_OFFSET   = 12.0f;
+static constexpr float MAX_VELOCITY_OFFSET   = 4.0f;
 
 // ── Constructor / Destructor ──────────────────────────────────────────────────
 
