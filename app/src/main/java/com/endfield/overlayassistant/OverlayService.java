@@ -20,19 +20,14 @@ import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
 
 import java.io.File;
-import java.util.ArrayList;
 import java.util.Calendar;
-import java.util.List;
+import java.util.HashSet;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 
 public class OverlayService extends Service {
 
     private static final String TAG        = "OverlayService";
     private static final String CHANNEL_ID = "endfield_overlay";
-
-    /** Static flag — survives Activity recreation, readable from MainActivity. */
-    public static volatile boolean sRunning = false;
     private static final int    NOTIF_ID   = 1001;
 
     public static final String ACTION_REFRESH_SETTINGS = "REFRESH_SETTINGS";
@@ -65,10 +60,9 @@ public class OverlayService extends Service {
     private Handler m_handler;
     private boolean m_nightMode = false;
 
-    // Tracks user-dropped VMD paths already registered with the engine.
-    // ConcurrentHashMap.newKeySet() is thread-safe — read on UI thread, written on GL thread.
-    private final Set<String> m_loadedUserVmds = ConcurrentHashMap.newKeySet();
-    private final List<FileObserver> m_motionObservers = new ArrayList<>();
+    // Tracks user-dropped VMD paths that are already registered with the engine.
+    private final Set<String> m_loadedUserVmds = new HashSet<>();
+    private FileObserver      m_motionObserver;
 
     private final Runnable m_tickRunnable = new Runnable() {
         @Override
@@ -84,7 +78,6 @@ public class OverlayService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
-        sRunning = true;
 
         // !! MUST happen first — Android gives 5 s before raising
         // ForegroundServiceDidNotStartInTimeException.  Create the channel
@@ -127,7 +120,6 @@ public class OverlayService extends Service {
 
     @Override
     public void onDestroy() {
-        sRunning = false;
         m_handler.removeCallbacksAndMessages(null);
         stopMotionObserver();
         removeOverlayWindow();
@@ -218,31 +210,28 @@ public class OverlayService extends Service {
     private void startMotionObserver() {
         stopMotionObserver();
 
-        // Watch each sub-folder individually with new File() constructor (API 29+ safe).
-        // Single-path FileObserver(String) is deprecated on API 29+ and may silently
-        // fail on MIUI/custom ROMs; it also does NOT recurse into sub-directories.
-        String[] subDirs = { "idle", "poses", "waiting", "dance", "touch" };
-        for (String sub : subDirs) {
-            File subFile = new File(ASSISTANT_BASE + "motions/" + sub);
-            if (!subFile.exists()) subFile.mkdirs();
-            FileObserver obs = new FileObserver(subFile,
-                    FileObserver.CREATE | FileObserver.MOVED_TO) {
-                @Override
-                public void onEvent(int event, @Nullable String path) {
-                    if (path == null || !path.toLowerCase().endsWith(".vmd")) return;
-                    Log.i(TAG, "FileObserver[" + sub + "]: " + path);
-                    m_handler.postDelayed(() -> scanUserVmds(), 500);
-                }
-            };
-            obs.startWatching();
-            m_motionObservers.add(obs);
-        }
-        Log.i(TAG, "Watching " + subDirs.length + " motion sub-folders");
+        String watchDir = ASSISTANT_BASE + "motions/";
+        File dir = new File(watchDir);
+        if (!dir.exists()) dir.mkdirs();
+
+        m_motionObserver = new FileObserver(watchDir,
+                FileObserver.CREATE | FileObserver.MOVED_TO) {
+            @Override
+            public void onEvent(int event, @Nullable String path) {
+                if (path == null || !path.toLowerCase().endsWith(".vmd")) return;
+                Log.i(TAG, "FileObserver: new VMD detected: " + path);
+                m_handler.postDelayed(() -> scanUserVmds(), 500);
+            }
+        };
+        m_motionObserver.startWatching();
+        Log.i(TAG, "Watching for VMD files in: " + watchDir);
     }
 
     private void stopMotionObserver() {
-        for (FileObserver obs : m_motionObservers) obs.stopWatching();
-        m_motionObservers.clear();
+        if (m_motionObserver != null) {
+            m_motionObserver.stopWatching();
+            m_motionObserver = null;
+        }
     }
 
     /**
@@ -280,16 +269,25 @@ public class OverlayService extends Service {
             m_nightMode = true;
             if (m_overlayView != null
                     && m_affinity.getTier() >= AffinityManager.TIER_PARTNER) {
-                m_nativeRenderer.nativePlayMotionCategory("night");
+                // nativePlayMotionCategory is a no-op — trigger directly via VMDManager
+                m_overlayView.queueGLEvent(() ->
+                        m_nativeRenderer.nativePlayMotionCategory("night"));
                 m_overlayView.showBubble(m_ai.getTimeGreeting(hour));
+            }
+            // FIX: nativeSetPowerSave was a no-op. Switch render mode to 30fps
+            // by using RENDERMODE_WHEN_DIRTY and scheduling redraws at ~30fps.
+            // This halves GPU usage between midnight and 6am.
+            if (m_overlayView != null) {
+                m_overlayView.setPowerSaveMode(true);
             }
         } else if (!night && m_nightMode) {
             m_nightMode = false;
-            m_nativeRenderer.nativePlayMotionCategory("idle");
+            m_overlayView.queueGLEvent(() ->
+                    m_nativeRenderer.nativePlayMotionCategory("idle"));
+            if (m_overlayView != null) {
+                m_overlayView.setPowerSaveMode(false);
+            }
         }
-        m_nativeRenderer.nativeSetPowerSave(night);
-        // BUG-3: actually switch render rate to save battery at night
-        if (m_overlayView != null) m_overlayView.setPowerSave(night);
     }
 
     // ── Notification ───────────────────────────────────────────────────────
