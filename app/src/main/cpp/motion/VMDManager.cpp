@@ -77,10 +77,10 @@ static constexpr float INERTIA_DECAY       = 0.80f;
 
 // ── Jiggle impulse constants ──────────────────────────────────────────────────
 
-static constexpr float JIGGLE_TRIGGER_DELTA  = 150.f;
+static constexpr float JIGGLE_TRIGGER_DELTA  = 50.f;
 static constexpr float JIGGLE_MASS_THRESHOLD = 0.3f;
-static constexpr float JIGGLE_IMPULSE_SCALE  = 0.0015f;
-static constexpr float JIGGLE_MAX_IMPULSE    = 3.0f;
+static constexpr float JIGGLE_IMPULSE_SCALE  = 0.035f;
+static constexpr float JIGGLE_MAX_IMPULSE    = 8.0f;
 static constexpr float JIGGLE_IMPULSE_DECAY  = 0.0f;
 
 // ── Constructor / Destructor ──────────────────────────────────────────────────
@@ -431,9 +431,47 @@ void VMDManager::update(float rawDeltaTime) {
         m_event.anim->Evaluate(m_event.time * 30.f, m_event.weight);
     }
 
-    // Run morph, IK (pre-physics), physics, IK (post-physics)
+    // Run morph, IK (pre-physics)
     model->UpdateMorphAnimation();
     model->UpdateNodeAnimation(false);
+
+    // ── Pre-physics jiggle override ───────────────────────────────────────
+    // Apply central impulse to ALL dynamic rigid bodies right before the
+    // physics step — this forces breast/hair bodies out of their
+    // animation-locked or sleeping state so Bullet can simulate them freely.
+    {
+        auto* mmPhysics = model->GetMMDPhysics();
+        if (mmPhysics) {
+            btDiscreteDynamicsWorld* world = mmPhysics->GetDynamicsWorld();
+            if (world &&
+                (std::abs(m_jiggleImpulseX) > 0.0001f ||
+                 std::abs(m_jiggleImpulseY) > 0.0001f))
+            {
+                const btCollisionObjectArray& objs = world->getCollisionObjectArray();
+                for (int i = 0; i < objs.size(); ++i) {
+                    btRigidBody* body = btRigidBody::upcast(objs[i]);
+                    if (!body || body->isStaticObject() || body->isKinematicObject()) continue;
+
+                    // Wake the body — kinematic lock puts them to sleep
+                    body->activate(true);
+
+                    float mass = body->getMass();
+                    // Heavier bodies (breast/hip in PMX) get proportionally
+                    // stronger impulse to overcome their animation constraint
+                    float scale = (mass >= JIGGLE_MASS_THRESHOLD)
+                                  ? (1.0f + mass * 0.5f)
+                                  : 1.0f;
+
+                    body->applyCentralImpulse(btVector3(
+                        m_jiggleImpulseX * scale,
+                        -m_jiggleImpulseY * scale,
+                        0.f
+                    ));
+                }
+            }
+        }
+    }
+
     model->UpdatePhysicsAnimation(physDt);
     model->UpdateNodeAnimation(true);
 
