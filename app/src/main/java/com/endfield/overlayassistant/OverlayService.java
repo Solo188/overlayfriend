@@ -50,7 +50,7 @@ public class OverlayService extends Service {
     //       └── touch/     (reactions on finger tap)
     //
     static final String ASSISTANT_BASE = "/sdcard/Documents/Assistant/";
-    static final String PMX_PATH       = ASSISTANT_BASE + "Yvonne.pmx";
+    static final String PMX_PATH       = ASSISTANT_BASE + "model.pmx";
 
     // Delay between model load and motion scan (waits for GL to initialise).
     private static final long MOTIONS_LOAD_DELAY = 2_000L;
