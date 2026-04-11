@@ -272,6 +272,10 @@ public class OverlayView extends FrameLayout {
     // ─────────────────────────────────────────────────────────────────────
 
     private int[] getScreenBounds() {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            android.graphics.Rect bounds = m_wm.getCurrentWindowMetrics().getBounds();
+            return new int[]{ 0, 0, bounds.width(), bounds.height() };
+        }
         DisplayMetrics dm = new DisplayMetrics();
         if (m_wm != null) m_wm.getDefaultDisplay().getRealMetrics(dm);
         return new int[]{ 0, 0, dm.widthPixels, dm.heightPixels };
@@ -302,9 +306,8 @@ public class OverlayView extends FrameLayout {
 
     public void showBubble(String text) {
         if (m_silentMode) return;
-        // FIX: remove any pending hide callback before scheduling a new one,
-        // otherwise rapid headpats hide the bubble early (previous postDelayed
-        // fires mid-message and makes the new bubble disappear).
+        // FIX: cancel any pending hide before scheduling a new one —
+        // otherwise rapid headpats dismiss the new bubble too early.
         m_uiHandler.removeCallbacks(m_hideBubbleRunnable);
         m_uiHandler.post(() -> {
             m_bubble.setText(text);
@@ -315,40 +318,6 @@ public class OverlayView extends FrameLayout {
 
     private final Runnable m_hideBubbleRunnable =
             () -> m_bubble.setVisibility(View.GONE);
-
-    /**
-     * Power-save mode: switch between full-speed (RENDERMODE_CONTINUOUSLY) and
-     * ~30 fps (RENDERMODE_WHEN_DIRTY + periodic invalidation) to save battery
-     * during night hours (00:00–06:00).
-     *
-     * Previously nativeSetPowerSave() was called for this but the native
-     * implementation was a no-op (only logged). This is the real fix.
-     */
-    public void setPowerSaveMode(boolean enabled) {
-        if (enabled) {
-            m_glView.setRenderMode(GLSurfaceView.RENDERMODE_WHEN_DIRTY);
-            schedulePowerSaveTick();
-        } else {
-            m_uiHandler.removeCallbacks(m_powerSaveTickRunnable);
-            m_glView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
-        }
-    }
-
-    private static final long POWER_SAVE_FRAME_MS = 33L; // ~30 fps
-
-    private final Runnable m_powerSaveTickRunnable = new Runnable() {
-        @Override public void run() {
-            if (m_glView != null) {
-                m_glView.requestRender();
-                m_uiHandler.postDelayed(this, POWER_SAVE_FRAME_MS);
-            }
-        }
-    };
-
-    private void schedulePowerSaveTick() {
-        m_uiHandler.removeCallbacks(m_powerSaveTickRunnable);
-        m_uiHandler.postDelayed(m_powerSaveTickRunnable, POWER_SAVE_FRAME_MS);
-    }
 
     public void setSilentMode(boolean s) {
         m_silentMode = s;
@@ -473,6 +442,31 @@ public class OverlayView extends FrameLayout {
      *   2. Queue nativeDestroy() and block on a CountDownLatch until it finishes.
      *   3. Only then call onPause(), which destroys the EGL surface safely.
      */
+
+    /** BUG-3: Switch render mode to save battery at night. */
+    public void setPowerSave(boolean enabled) {
+        if (enabled) {
+            m_glView.setRenderMode(GLSurfaceView.RENDERMODE_WHEN_DIRTY);
+            // Schedule ~30fps redraws manually — without this WHEN_DIRTY
+            // mode causes the animation to completely freeze because nobody
+            // calls requestRender().
+            m_uiHandler.removeCallbacks(m_powerSaveTick);
+            m_uiHandler.postDelayed(m_powerSaveTick, 33L);
+        } else {
+            m_uiHandler.removeCallbacks(m_powerSaveTick);
+            m_glView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
+        }
+    }
+
+    private final Runnable m_powerSaveTick = new Runnable() {
+        @Override public void run() {
+            if (m_glView != null) {
+                m_glView.requestRender();
+                m_uiHandler.postDelayed(this, 33L); // ~30 fps
+            }
+        }
+    };
+
     @Override
     protected void onDetachedFromWindow() {
         m_glReady = false;
@@ -483,16 +477,19 @@ public class OverlayView extends FrameLayout {
             latch.countDown();
         });
 
-        try {
-            // 2-second safety timeout prevents ANR if the GL thread is hung.
-            if (!latch.await(2, TimeUnit.SECONDS)) {
-                Log.w(TAG, "nativeDestroy did not complete within 2 s — proceeding anyway");
+        // CRASH-4: await on a background thread — blocking main thread for 2 s risks ANR.
+        // onPause() is called from the background thread once nativeDestroy completes.
+        new Thread(() -> {
+            try {
+                if (!latch.await(2, TimeUnit.SECONDS)) {
+                    Log.w(TAG, "nativeDestroy did not complete within 2 s — proceeding anyway");
+                }
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
             }
-        } catch (InterruptedException ignored) {
-            Thread.currentThread().interrupt();
-        }
+            m_glView.onPause();
+        }, "gl-destroy").start();
 
-        m_glView.onPause();
         super.onDetachedFromWindow();
     }
 }
