@@ -4,17 +4,41 @@
 
     <string name="section_permissions">Permissions</string>
     <string name="section_character">Character Model</string>
+    <string name="section_folders">File Structure</string>
     <string name="perm_overlay">Draw Over Other Apps</string>
     <string name="perm_notifications">Notifications</string>
     <string name="btn_start">Start Overlay</string>
     <string name="btn_stop">Stop Overlay</string>
     <string name="btn_settings">Setting</string>
     <string name="btn_creator">Creator</string>
+    <string name="btn_copy">Copy</string>
+    <string name="btn_open_folder">📁 Open Folder in Files App</string>
     <string name="affinity_loading">Loading affinity…</string>
     <string name="affinity_display">Affinity: %1$d pts — %2$s</string>
     <string name="scanning_models">Scanning model folders…</string>
     <string name="no_models_found">No .pmx models found in /sdcard/Documents/Assistant/</string>
     <string name="selected_char">Character: %1$s</string>
+
+    <!-- Folder structure card -->
+    <string name="folder_base">/sdcard/Documents/Assistant/</string>
+    <string name="folder_pmx">  Yvonne.pmx</string>
+    <string name="folder_textures">  textures/</string>
+    <string name="folder_idle">  motions/idle/</string>
+    <string name="folder_poses">  motions/poses/</string>
+    <string name="folder_waiting">  motions/waiting/</string>
+    <string name="folder_dance">  motions/dance/</string>
+    <string name="folder_touch">  motions/touch/</string>
+    <string name="folder_hint">● idle — looping breath/stand animations\n● poses — static base poses\n● waiting — random reactions (70%)\n● dance — random dance events (30%)\n● touch — tap reactions\n\nFolders are created automatically on first launch.</string>
+
+    <!-- Folder status labels -->
+    <string name="status_ok">✓ OK</string>
+    <string name="status_missing">✗ missing</string>
+    <string name="status_empty">⚠ empty</string>
+    <string name="status_files">%1$d files</string>
+
+    <!-- Toast messages -->
+    <string name="toast_path_copied">Path copied to clipboard</string>
+    <string name="toast_folders_created">Folders created in /sdcard/Documents/Assistant/</string>
 
     <string name="settings_title">Settings</string>
     <string name="label_scale">Model Scale (0.5× – 2.5×)</string>
