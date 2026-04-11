@@ -50,7 +50,22 @@ public class OverlayService extends Service {
     //       └── touch/     (reactions on finger tap)
     //
     static final String ASSISTANT_BASE = "/sdcard/Documents/Assistant/";
-    static final String PMX_PATH       = ASSISTANT_BASE + "model.pmx";
+
+    /**
+     * Scan ASSISTANT_BASE for the first .pmx file (case-insensitive, alphabetical order).
+     * Returns the absolute path, or null if nothing is found.
+     * Static so MainActivity can call it without a service instance.
+     */
+    @Nullable
+    static String findModelFile() {
+        File dir = new File(ASSISTANT_BASE);
+        if (!dir.isDirectory()) return null;
+        File[] pmxFiles = dir.listFiles(
+                (d, name) -> name.toLowerCase().endsWith(".pmx"));
+        if (pmxFiles == null || pmxFiles.length == 0) return null;
+        java.util.Arrays.sort(pmxFiles);   // deterministic: alphabetical
+        return pmxFiles[0].getAbsolutePath();
+    }
 
     // Delay between model load and motion scan (waits for GL to initialise).
     private static final long MOTIONS_LOAD_DELAY = 2_000L;
@@ -186,15 +201,27 @@ public class OverlayService extends Service {
         m_overlayView = new OverlayView(this, m_nativeRenderer, m_affinity, m_ai, params);
         m_windowManager.addView(m_overlayView, params);
 
+        // Discover the model file at runtime — supports any .pmx filename.
+        String pmxPath = findModelFile();
+        if (pmxPath == null) {
+            Log.e(TAG, "No .pmx file found in " + ASSISTANT_BASE + " — cannot start overlay");
+            stopSelf();
+            return;
+        }
+
+        // The motions/ and textures/ folders live next to the .pmx file.
+        // Using the parent dir keeps paths relative to wherever the model is placed.
+        final String modelBaseDir = new File(pmxPath).getParent();
+
         // loadModel() enqueues nativeLoadModel on the GL thread — never blocks UI.
-        m_overlayView.loadModel(PMX_PATH);
+        m_overlayView.loadModel(pmxPath);
 
         // After the GL thread has initialised and loaded the model,
         // scan the motions folder.  nativeScanMotions goes via queueGLEvent.
         m_handler.postDelayed(() -> {
             if (m_overlayView == null) return;
             m_overlayView.queueGLEvent(() ->
-                    m_nativeRenderer.nativeScanMotions(ASSISTANT_BASE));
+                    m_nativeRenderer.nativeScanMotions(modelBaseDir));
             startMotionObserver();
         }, MOTIONS_LOAD_DELAY);
 
@@ -313,7 +340,7 @@ public class OverlayService extends Service {
 
         return new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setContentTitle("Endfield Overlay")
-                .setContentText("Yvonne is running")
+                .setContentText("Overlay is running")
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
                 .setContentIntent(openPi)
                 .addAction(android.R.drawable.ic_media_pause, "Stop", stopPi)

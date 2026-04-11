@@ -199,9 +199,10 @@ public class MainActivity extends AppCompatActivity {
      *   red    "✗ missing"  — path does not exist
      */
     private void refreshFolderStatus() {
-        // PMX model file
-        File pmx = new File(OverlayService.PMX_PATH);
-        setStatus(m_iconPmx, m_statusPmx, pmx.exists() ? Status.OK : Status.MISSING, 0);
+        // PMX model file — scan dynamically, don't rely on a hardcoded name
+        String pmxPath = OverlayService.findModelFile();
+        setStatus(m_iconPmx, m_statusPmx,
+                  pmxPath != null ? Status.OK : Status.MISSING, 0);
 
         // textures/ folder — just check existence
         File texDir = new File(OverlayService.ASSISTANT_BASE + "textures");
@@ -282,7 +283,7 @@ public class MainActivity extends AppCompatActivity {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             if (!Environment.isExternalStorageManager()) {
                 Toast.makeText(this,
-                    "Storage permission needed to read Yvonne.pmx",
+                    "Storage permission needed to read .pmx model",
                     Toast.LENGTH_LONG).show();
                 m_storagePermLauncher.launch(new Intent(
                     Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
@@ -307,7 +308,7 @@ public class MainActivity extends AppCompatActivity {
                 requestStoragePermissionIfNeeded();
             } else {
                 Toast.makeText(this,
-                    "Yvonne.pmx not found in " + OverlayService.ASSISTANT_BASE,
+                    "No .pmx files found in " + OverlayService.ASSISTANT_BASE,
                     Toast.LENGTH_LONG).show();
             }
             return;
@@ -330,11 +331,19 @@ public class MainActivity extends AppCompatActivity {
             m_modelReady = false;
             return;
         }
-        File pmx = new File(OverlayService.PMX_PATH);
-        m_modelReady = pmx.exists();
-        m_tvCharSelected.setText(m_modelReady
-            ? getString(R.string.selected_char, "Yvonne")
-            : "Place Yvonne.pmx in " + OverlayService.ASSISTANT_BASE);
+        String pmxPath = OverlayService.findModelFile();
+        m_modelReady = (pmxPath != null);
+        if (m_modelReady) {
+            // Show just the filename without extension, e.g. "Character: Yvonne"
+            String fileName = new File(pmxPath).getName();
+            String modelName = fileName.contains(".")
+                    ? fileName.substring(0, fileName.lastIndexOf('.'))
+                    : fileName;
+            m_tvCharSelected.setText(getString(R.string.selected_char, modelName));
+        } else {
+            m_tvCharSelected.setText(
+                    "No .pmx files found in " + OverlayService.ASSISTANT_BASE);
+        }
     }
 
     private void refreshPermissionSwitches() {
