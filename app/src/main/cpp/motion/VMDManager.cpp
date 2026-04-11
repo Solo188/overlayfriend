@@ -108,7 +108,7 @@ static constexpr float JIGGLE_MAX_IMPULSE    = 5.0f;
 static constexpr float JIGGLE_IMPULSE_DECAY  = 0.88f;
 static constexpr float LINEAR_DAMPING        = 0.95f;
 static constexpr float ANGULAR_DAMPING       = 0.95f;
-static constexpr float MAX_VELOCITY_OFFSET   = 9.0f;
+static constexpr float MAX_VELOCITY_OFFSET   = 12.0f;
 
 // ── Constructor / Destructor ──────────────────────────────────────────────────
 
@@ -440,18 +440,10 @@ void VMDManager::applyJiggleImpulses(void* modelRaw) {
         float mass = rb->getMass();
         if (mass < JIGGLE_MASS_THRESHOLD) continue;
 
-        // ── Step 1: Apply High-Damping on first trigger ───────────────────
-        // setDamping persists across frames — we only need to set it once
-        // per jiggle event, not every frame.  This converts the body from
-        // an elastic spring into a soft-tissue mass.
-        if (m_jiggleFired) {
-            rb->setDamping(LINEAR_DAMPING, ANGULAR_DAMPING);
-        }
-
         // ── Step 2: Wake the body unconditionally ─────────────────────────
-        // Bullet puts dynamic bodies to sleep after ~2 s of low movement.
-        // A sleeping body ignores ALL forces and impulses silently.
-        // activate(true) forces it awake so even subtle jiggles are felt.
+        // DISABLE_DEACTIVATION is set in update() Step 0b, but activate(true)
+        // here is an extra guarantee for bodies that may have been reset by
+        // Saba's ResetPhysics between frames.
         rb->activate(true);
 
         // ── Step 3: Mass-scaled impulse ───────────────────────────────────
@@ -480,84 +472,182 @@ void VMDManager::applyJiggleImpulses(void* modelRaw) {
     m_jiggleImpulseY *= JIGGLE_IMPULSE_DECAY;
 }
 
-// ── Main update ───────────────────────────────────────────────────────────────
-
+// ── Main update — Animation → Force Injection → Physics → Bone Sync ──────────
+//
+// Pipeline (strict order, each step depends on the previous):
+//
+//   Step 0  Advance timers, layer weights, morph/blink
+//   Step 1  Evaluate VMD keyframes → bone local transforms (BeginAnimation …
+//             UpdateMorphAnimation, Evaluate layers)
+//   Step 2  Pre-physics bone update: UpdateNodeAnimation(false)
+//             Propagates VMD result into global bone matrices for bones that
+//             are NOT driven after physics (IsDeformAfterPhysics == false).
+//             Kinematic bodies read these matrices to place themselves.
+//   Step 3  Force injection window — applyPhysicsInertia + applyJiggleImpulses.
+//             This is the ONLY correct moment: bones are positioned by VMD,
+//             but Bullet hasn't stepped yet.  Forces applied here survive the
+//             upcoming stepSimulation call intact.
+//   Step 4  Physics solve — model->UpdatePhysicsAnimation(physDt).
+//             Internally: SetActivation(true) on all MMDRigidBody objects
+//             (switches Dynamic bodies to their active MotionState so Bullet
+//             drives them instead of VMD keyframes), calls
+//             physics->Update(physDt) → stepSimulation, then
+//             ReflectGlobalTransform + CalcLocalTransform to write Bullet
+//             results back into MMDNode global matrices.
+//   Step 5  Post-physics bone update: UpdateNodeAnimation(true)
+//             Propagates physics results into bones flagged
+//             IsDeformAfterPhysics == true (hair, cloth, skirt chains).
+//   Step 6  model->Update() — compute final skinning matrices.
+//   Step 7  EndAnimation()
+//
+// Physics-priority guarantee:
+//   Dynamic MMDRigidBody objects (breast/hair/skirt in PMX) use
+//   DynamicMotionState / DynamicAndBoneMergeMotionState.  When
+//   SetActivation(true) is called in Step 4, Bullet removes the
+//   CF_KINEMATIC_OBJECT flag and switches to the active MotionState —
+//   after that, the rigid body's world transform is driven 100% by
+//   Bullet's simulation result.  VMD keyframes for those bones are
+//   loaded in Step 1–2 but then overwritten in Step 4–5 by physics.
+//   So we do NOT need a separate "ignore VMD for physics bones" loop —
+//   Saba already implements this through the MotionState pattern.
+//
+// Substep stabilisation:
+//   We configure MMDPhysics before the first solve to use fixed 60Hz
+//   substeps with up to 4 substeps per frame.  This prevents jitter
+//   during heavy dance animations where the animation clock and the
+//   physics clock can diverge by up to 2× (e.g. GC pause → large dt).
+//
 void VMDManager::update(float rawDeltaTime) {
     if (!m_renderer) return;
 
     saba::MMDModel* model = m_renderer->getModel();
     if (!model) return;
 
-    // Clamp animation clock to avoid large jumps after GC pauses / app resumes.
-    const float animDt = std::min(rawDeltaTime, MAX_ANIM_DT);
-
-    // EMA-smoothed physics dt — absorbs single-frame spikes for Bullet stability.
-    m_smoothedPhysDt = m_smoothedPhysDt * (1.f - PHYS_DT_EMA)
-                     + animDt            * PHYS_DT_EMA;
-    // Clamp physDt to max 1/60 s — prevents physics "explosions" on frame drops.
-    const float physDt = std::max(std::min(m_smoothedPhysDt, 1.f / 60.f), 0.001f);
-
-    tickBlink(animDt);
-    tickMouth(animDt);
-    tickEventTimer(animDt);
-    applyPhysicsInertia(model, physDt);
-    applyJiggleImpulses(model);
-
-    // ── Advance Layer 0 (base / idle) ─────────────────────────────────────
-    if (m_base.anim) {
-        m_base.time += animDt;
-        if (m_base.looping && m_base.duration > 0.f && m_base.time > m_base.duration) {
-            // Seamless loop: carry overshoot so seam is invisible.
-            m_base.time = std::fmod(m_base.time, m_base.duration);
+    // ── Step 0a: Configure physics substep on first call ─────────────────
+    // SetFPS / SetMaxSubStepCount are cheap no-ops after the first frame.
+    // 60 Hz fixed substep, max 4 substeps = handles up to 4× frame-time
+    // spikes (GC pauses, activity resume) without physics explosion.
+    {
+        auto* physMan = model->GetPhysicsManager();
+        if (physMan) {
+            auto* mmPhysics = physMan->GetMMDPhysics();
+            if (mmPhysics) {
+                mmPhysics->SetFPS(60.f);
+                mmPhysics->SetMaxSubStepCount(4);
+            }
         }
     }
 
-    // ── Advance Layer 1 (event) ───────────────────────────────────────────
+    // ── Step 0b: Force DISABLE_DEACTIVATION on all dynamic bodies ────────
+    // Bullet's sleep system silently ignores forces on sleeping bodies.
+    // During idle the model barely moves so bodies fall asleep within ~2 s.
+    // Setting DISABLE_DEACTIVATION once here prevents that for the whole
+    // session — the overhead is negligible (one flag check per body/frame).
+    // We also set high damping (LINEAR_DAMPING / ANGULAR_DAMPING) for the
+    // "heavy tissue" behaviour requested; setDamping is idempotent.
+    {
+        auto* physMan = model->GetPhysicsManager();
+        if (physMan) {
+            auto* rigidbodys = physMan->GetRigidBodys();
+            if (rigidbodys) {
+                for (auto& mmdRb : *rigidbodys) {
+                    btRigidBody* rb = mmdRb->GetRigidBody();
+                    if (!rb || rb->isStaticObject() || rb->isKinematicObject()) continue;
+                    if (rb->getMass() < JIGGLE_MASS_THRESHOLD) continue;
+
+                    // Prevent sleep — ensures subtle jiggles are never silently ignored.
+                    rb->setActivationState(DISABLE_DEACTIVATION);
+                    // High damping = soft-tissue resistance (no jelly bounce).
+                    rb->setDamping(LINEAR_DAMPING, ANGULAR_DAMPING);
+                }
+            }
+        }
+    }
+
+    // ── Step 0c: Clamp delta time ─────────────────────────────────────────
+    // MAX_ANIM_DT caps the animation clock so a GC pause does not make
+    // characters teleport.  EMA smooths the physics dt for Bullet stability.
+    const float animDt = std::min(rawDeltaTime, MAX_ANIM_DT);
+
+    m_smoothedPhysDt = m_smoothedPhysDt * (1.f - PHYS_DT_EMA)
+                     + animDt            * PHYS_DT_EMA;
+    // physDt is passed to Saba's UpdatePhysicsAnimation, which passes it to
+    // MMDPhysics::Update → stepSimulation(physDt, maxSubSteps, 1/fps).
+    // Clamp to [0.001, 1/30] — prevents runaway on very slow frames.
+    const float physDt = std::max(0.001f, std::min(m_smoothedPhysDt, 1.f / 30.f));
+
+    // ── Step 0d: Tick auxiliary systems ───────────────────────────────────
+    tickBlink(animDt);
+    tickMouth(animDt);
+    tickEventTimer(animDt);
+
+    // ── Step 1: Advance animation layers and evaluate VMD keyframes ───────
+    if (m_base.anim) {
+        m_base.time += animDt;
+        if (m_base.looping && m_base.duration > 0.f && m_base.time > m_base.duration)
+            m_base.time = std::fmod(m_base.time, m_base.duration);
+    }
+
     if (m_eventActive && m_event.anim) {
         m_event.time += animDt;
         if (m_event.duration > 0.f && m_event.time >= m_event.duration) {
-            // Event finished: return idle to full weight.
-            m_eventActive    = false;
-            m_event.target   = 0.f;
-            m_base.target    = 1.f;
+            m_eventActive  = false;
+            m_event.target = 0.f;
+            m_base.target  = 1.f;
             LOGI("Event [%s] complete", m_event.category.c_str());
         }
     }
 
-    // ── Smooth weight fade ────────────────────────────────────────────────
-    // First-order low-pass: weight tracks target at WEIGHT_FADE_SPEED units/s.
     float alpha = std::min(1.f, WEIGHT_FADE_SPEED * animDt);
     m_base.weight  += (m_base.target  - m_base.weight)  * alpha;
-    m_event.weight += (m_event.target - m_event.weight)  * alpha;
+    m_event.weight += (m_event.target - m_event.weight) * alpha;
 
-    // ── Two-layer Evaluate ────────────────────────────────────────────────
-    //
-    // Saba's VMDAnimation::Evaluate(frame, weight) additively accumulates
-    // weighted bone transform offsets.  Calling Layer-0 then Layer-1 in a
-    // single BeginAnimation / EndAnimation block achieves multi-layer blend:
-    //
-    //   FinalTransform ≈ (idle * idleWeight) + (event * eventWeight)
-    //
-    // When a static pose is used as the base and idle is the overlay:
-    //   FinalTransform = (PoseTransform * 1.0) + (IdleTransform * 0.3)
-    // achieved by setting m_base.target = 0.3 when the pose is active.
-    //
     model->BeginAnimation();
 
-    if (m_base.anim && m_base.weight > 0.001f) {
+    if (m_base.anim && m_base.weight > 0.001f)
         m_base.anim->Evaluate(m_base.time * 30.f, m_base.weight);
-    }
 
-    if (m_event.anim && m_event.weight > 0.001f) {
+    if (m_event.anim && m_event.weight > 0.001f)
         m_event.anim->Evaluate(m_event.time * 30.f, m_event.weight);
-    }
 
-    // Run morph, IK (pre-physics), physics, IK (post-physics)
     model->UpdateMorphAnimation();
+
+    // ── Step 2: Pre-physics bone update ───────────────────────────────────
+    // Propagates VMD keyframe results (local transforms) into world-space
+    // global matrices for bones where IsDeformAfterPhysics == false.
+    // Kinematic rigid bodies (bone-driven) read these matrices now to
+    // position themselves in the Bullet world before the physics step.
     model->UpdateNodeAnimation(false);
+
+    // ── Step 3: Force injection — AFTER bone update, BEFORE physics step ─
+    // This is the critical ordering: VMD has placed bones, but Bullet hasn't
+    // run yet.  Gravity tilt and jiggle impulses injected here are seen by
+    // the upcoming stepSimulation and influence the physics outcome.
+    //
+    // If we called applyPhysicsInertia BEFORE UpdateNodeAnimation(false)
+    // (as in the old code), kinematic bodies would not yet reflect the VMD
+    // pose, so the forces would be computed against stale positions.
+    applyPhysicsInertia(model, physDt);
+    applyJiggleImpulses(model);
+
+    // ── Step 4: Physics solve ─────────────────────────────────────────────
+    // Internally:
+    //   1. SetActivation(true) on all MMDRigidBody objects — this is the
+    //      Kinematic→Dynamic switch for breast/hair bodies.  After this call
+    //      their world transform is owned by Bullet, NOT by VMD keyframes.
+    //   2. physics->Update(elapsed) → stepSimulation with configured substeps.
+    //   3. ReflectGlobalTransform + CalcLocalTransform — writes Bullet results
+    //      back into MMDNode global and local matrices.
     model->UpdatePhysicsAnimation(physDt);
+
+    // ── Step 5: Post-physics bone update ─────────────────────────────────
+    // Propagates physics results into child bones flagged
+    // IsDeformAfterPhysics == true (hair chains, cloth, skirt joints).
+    // These bones read the world matrices written by Step 4 and compute
+    // their own positions relative to the physics-driven parent.
     model->UpdateNodeAnimation(true);
 
+    // ── Step 6 & 7: Finalize ──────────────────────────────────────────────
     model->Update();
     model->EndAnimation();
 }
