@@ -70,38 +70,18 @@ static constexpr float PHYS_DT_EMA = 0.12f;
 static constexpr float WEIGHT_FADE_SPEED = 2.5f;
 
 // ── Physics inertia constants ─────────────────────────────────────────────────
-//
-// DRAG_INERTIA_SCALE: how strongly screen-space drag velocity tilts gravity.
-//   Horizontal drag (m_dragVelX) → tilt gravity on X axis (left/right sway).
-//   Vertical drag   (m_dragVelY) → tilt gravity on Y axis (up/down inertia).
-//   Previously m_dragVelY was mapped to Z (depth) — that was wrong and caused
-//   breast/hair to push "into/out of screen" during vertical moves.
-//
-static constexpr float DRAG_INERTIA_SCALE    = 18.f / 2000.f;
-static constexpr float MAX_LATERAL_GRAVITY   = 20.f;    // X tilt cap (±)
-static constexpr float MAX_VERTICAL_GRAVITY  = 12.f;    // Y tilt cap — smaller
-                                                         // so model doesn't
-                                                         // float off-screen
-static constexpr float INERTIA_DECAY         = 0.80f;
+
+static constexpr float DRAG_INERTIA_SCALE  = 18.f / 2000.f;
+static constexpr float MAX_LATERAL_GRAVITY = 20.f;
+static constexpr float INERTIA_DECAY       = 0.80f;
 
 // ── Jiggle impulse constants ──────────────────────────────────────────────────
-//
-// FIX: JIGGLE_IMPULSE_DECAY was 0.0f — that zeroed the impulse every frame so
-// the jiggle lasted exactly ONE frame and then stopped dead (wooden feeling).
-// 0.85f lets the force decay over ~6 frames at 60fps → natural spring-out.
-//
-// FIX: JIGGLE_IMPULSE_SCALE raised 0.0015 → 0.008 because vertical impulses
-// now map to the Y axis (previously went to Z where they had no visible effect).
-// If physics feels "explosive" on your device, lower this toward 0.004.
-//
-// FIX: JIGGLE_TRIGGER_DELTA lowered 150 → 80 so the jiggle fires on moderate
-// moves, not just violent flicks.
-//
-static constexpr float JIGGLE_TRIGGER_DELTA  = 80.f;
+
+static constexpr float JIGGLE_TRIGGER_DELTA  = 50.f;
 static constexpr float JIGGLE_MASS_THRESHOLD = 0.3f;
-static constexpr float JIGGLE_IMPULSE_SCALE  = 0.008f;
-static constexpr float JIGGLE_MAX_IMPULSE    = 4.0f;
-static constexpr float JIGGLE_IMPULSE_DECAY  = 0.85f;   // was 0.0f — KEY FIX
+static constexpr float JIGGLE_IMPULSE_SCALE  = 0.035f;
+static constexpr float JIGGLE_MAX_IMPULSE    = 8.0f;
+static constexpr float JIGGLE_IMPULSE_DECAY  = 0.85f;
 
 // ── Constructor / Destructor ──────────────────────────────────────────────────
 
@@ -294,23 +274,7 @@ void VMDManager::tickEventTimer(float dt) {
 }
 
 // ── Physics inertia (gravity tilt → hair / cloth) ─────────────────────────────
-//
-// Screen-space drag → Bullet gravity mapping:
-//
-//   m_dragVelX (finger moving left/right on screen)
-//     → tilt gravity on BULLET X-axis  (model sways left/right)   ✓ was correct
-//
-//   m_dragVelY (finger moving up/down on screen)
-//     → tilt gravity on BULLET Y-axis  (model feels acceleration up/down) ✓ FIXED
-//     Previously mapped to Z (depth into screen) which caused breast/hair to
-//     push "forward or backward" during vertical movement — that's the bug
-//     Gemini described as "перепутанные оси".
-//
-// When the overlay falls downward (velY > 0 in screen coords):
-//   The model experiences an upward pseudo-force (inertia opposes motion).
-//   We reduce the downward gravity slightly so soft bodies lag behind → looks
-//   like they float up while the model drops. That is the correct "lift" effect.
-//
+
 void VMDManager::applyPhysicsInertia(void* modelRaw, float /*dt*/) {
     saba::MMDModel* model = static_cast<saba::MMDModel*>(modelRaw);
     if (!model) return;
@@ -319,48 +283,28 @@ void VMDManager::applyPhysicsInertia(void* modelRaw, float /*dt*/) {
     btDiscreteDynamicsWorld* world = mmPhysics->GetDynamicsWorld();
     if (!world) return;
 
-    // Horizontal drag → X tilt (unchanged, already correct)
+    // X-axis tilt: horizontal screen drag → lateral gravity
     float targetGx = std::max(-MAX_LATERAL_GRAVITY,
                      std::min( MAX_LATERAL_GRAVITY, -m_dragVelX * DRAG_INERTIA_SCALE));
-
-    // Vertical drag → Y component of gravity (KEY FIX: was Z before)
-    // Screen Y grows downward; Bullet Y grows upward.
-    // Moving the window DOWN (velY > 0) → model is falling → soft bodies should
-    // feel lighter (gravity temporarily reduced = upward inertia). So we ADD
-    // a positive offset to the -9.8 base.
-    float targetGy_offset = std::max(-MAX_VERTICAL_GRAVITY,
-                            std::min( MAX_VERTICAL_GRAVITY,  m_dragVelY * DRAG_INERTIA_SCALE));
+    // Y-axis inertia: vertical screen drag → up/down gravity offset (jump/fall effect)
+    // Previously mapped to Z (into screen) — wrong for Y-up MMD coordinate system.
+    float targetGy = std::max(-MAX_LATERAL_GRAVITY,
+                     std::min( MAX_LATERAL_GRAVITY, -m_dragVelY * DRAG_INERTIA_SCALE));
 
     btVector3 curG = world->getGravity();
+    float newGx = curG.x() + (targetGx - curG.x()) * (1.f - INERTIA_DECAY);
+    float newGy = curG.y() + ((-9.8f + targetGy) - curG.y()) * (1.f - INERTIA_DECAY);
 
-    // Lerp X and Y offsets toward their targets
-    float newGx = curG.x() + (targetGx       - curG.x()) * (1.f - INERTIA_DECAY);
-    float newGy_offset = m_gravYOffset + (targetGy_offset - m_gravYOffset) * (1.f - INERTIA_DECAY);
-
-    // When velocity is near zero, decay both offsets back toward neutral
-    bool nearStill = (std::abs(m_dragVelX) < 5.f && std::abs(m_dragVelY) < 5.f);
-    if (nearStill) {
-        newGx        *= INERTIA_DECAY;
-        newGy_offset *= INERTIA_DECAY;
+    if (std::abs(m_dragVelX) < 5.f && std::abs(m_dragVelY) < 5.f) {
+        newGx *= INERTIA_DECAY;
+        newGy  = curG.y() + (-9.8f - curG.y()) * (1.f - INERTIA_DECAY);
     }
 
-    m_gravYOffset = newGy_offset;
-
-    // Base gravity is -9.8 on Y; we add the offset on top.
-    // Z stays 0 — we no longer use it for screen-drag inertia.
-    world->setGravity(btVector3(newGx, -9.8f + newGy_offset, 0.f));
+    world->setGravity(btVector3(newGx, newGy, 0.f));
 }
 
 // ── Jiggle impulse (heavy rigid bodies = breast / hip) ────────────────────────
-//
-// FIX 1: Impulse direction — previously both X and Y screen-drag components
-//   were applied as Bullet (X, 0, Y) i.e. horizontal plane only.
-//   Vertical screen drag (deltaVy) now maps to Bullet Y so a downward flick
-//   creates an upward impulse on breast bodies → they bounce vertically.
-//
-// FIX 2: JIGGLE_IMPULSE_DECAY is now 0.85f (was 0.0f) so the accumulated
-//   impulse persists across frames and decays smoothly (spring-out effect).
-//
+
 void VMDManager::applyJiggleImpulses(void* modelRaw) {
     float deltaVx = m_dragVelX - m_prevDragVelX;
     float deltaVy = m_dragVelY - m_prevDragVelY;
@@ -371,14 +315,8 @@ void VMDManager::applyJiggleImpulses(void* modelRaw) {
 
     bool trigger = (deltaMag >= JIGGLE_TRIGGER_DELTA) && !m_jiggleFired;
     if (trigger) {
-        // X screen → Bullet X (left/right)
-        // Y screen → Bullet Y (up/down) — KEY FIX: was applied to Z before
-        // Negate: if window moves down fast, impulse should push soft bodies UP.
         m_jiggleImpulseX = -deltaVx * JIGGLE_IMPULSE_SCALE;
-        m_jiggleImpulseY = -deltaVy * JIGGLE_IMPULSE_SCALE;  // vertical spring
-
-        // Safety clamp for Poco X3 Pro (high-frequency touch events can produce
-        // very large deltaV on a fast swipe — without this Bullet can explode).
+        m_jiggleImpulseY = -deltaVy * JIGGLE_IMPULSE_SCALE;
         float mag = std::sqrt(m_jiggleImpulseX * m_jiggleImpulseX +
                               m_jiggleImpulseY * m_jiggleImpulseY);
         if (mag > JIGGLE_MAX_IMPULSE) {
@@ -387,7 +325,7 @@ void VMDManager::applyJiggleImpulses(void* modelRaw) {
             m_jiggleImpulseY *= s;
         }
         m_jiggleFired = true;
-        LOGI("Jiggle: X=%.3f Y=%.3f dV=%.1f", m_jiggleImpulseX, m_jiggleImpulseY, deltaMag);
+        LOGI("Jiggle: (%.3f, %.3f) dV=%.1f", m_jiggleImpulseX, m_jiggleImpulseY, deltaMag);
     } else if (deltaMag < JIGGLE_TRIGGER_DELTA * 0.5f) {
         m_jiggleFired = false;
     }
@@ -410,23 +348,17 @@ void VMDManager::applyJiggleImpulses(void* modelRaw) {
         if (mass < JIGGLE_MASS_THRESHOLD) continue;
 
         float scaledIx = m_jiggleImpulseX * mass;
-        float scaledIy = m_jiggleImpulseY * mass;   // vertical component
-
-        // Per-body clamp — prevents a single heavy body from exploding
-        float bodyMag = std::sqrt(scaledIx * scaledIx + scaledIy * scaledIy);
+        float scaledIy = m_jiggleImpulseY * mass;
+        float bodyMag  = std::sqrt(scaledIx * scaledIx + scaledIy * scaledIy);
         if (bodyMag > JIGGLE_MAX_IMPULSE * mass) {
             float s = JIGGLE_MAX_IMPULSE * mass / bodyMag;
             scaledIx *= s;
             scaledIy *= s;
         }
-
-        // Apply impulse: X=left/right, Y=up/down, Z=0 (no depth component)
-        // Previously: btVector3(scaledIx, 0.f, scaledIy) — Y screen went to Z!
-        rb->applyCentralImpulse(btVector3(scaledIx, scaledIy, 0.f));
+        rb->applyCentralImpulse(btVector3(scaledIx, scaledIy, 0.f)); // FIX: Y→Y not Y→Z
         rb->activate(true);
     }
 
-    // Decay impulse across frames for spring-out effect (was 0.0f = instant kill)
     m_jiggleImpulseX *= JIGGLE_IMPULSE_DECAY;
     m_jiggleImpulseY *= JIGGLE_IMPULSE_DECAY;
 }
@@ -445,7 +377,8 @@ void VMDManager::update(float rawDeltaTime) {
     // EMA-smoothed physics dt — absorbs single-frame spikes for Bullet stability.
     m_smoothedPhysDt = m_smoothedPhysDt * (1.f - PHYS_DT_EMA)
                      + animDt            * PHYS_DT_EMA;
-    const float physDt = std::max(m_smoothedPhysDt, 0.001f);
+    // Clamp physDt to max 1/60 s — prevents physics "explosions" on frame drops.
+    const float physDt = std::max(std::min(m_smoothedPhysDt, 1.f / 60.f), 0.001f);
 
     tickBlink(animDt);
     tickMouth(animDt);
@@ -502,9 +435,47 @@ void VMDManager::update(float rawDeltaTime) {
         m_event.anim->Evaluate(m_event.time * 30.f, m_event.weight);
     }
 
-    // Run morph, IK (pre-physics), physics, IK (post-physics)
+    // Run morph, IK (pre-physics)
     model->UpdateMorphAnimation();
     model->UpdateNodeAnimation(false);
+
+    // ── Pre-physics jiggle override ───────────────────────────────────────
+    // Apply central impulse to ALL dynamic rigid bodies right before the
+    // physics step — this forces breast/hair bodies out of their
+    // animation-locked or sleeping state so Bullet can simulate them freely.
+    {
+        auto* mmPhysics = model->GetMMDPhysics();
+        if (mmPhysics) {
+            btDiscreteDynamicsWorld* world = mmPhysics->GetDynamicsWorld();
+            if (world &&
+                (std::abs(m_jiggleImpulseX) > 0.0001f ||
+                 std::abs(m_jiggleImpulseY) > 0.0001f))
+            {
+                const btCollisionObjectArray& objs = world->getCollisionObjectArray();
+                for (int i = 0; i < objs.size(); ++i) {
+                    btRigidBody* body = btRigidBody::upcast(objs[i]);
+                    if (!body || body->isStaticObject() || body->isKinematicObject()) continue;
+
+                    // Wake the body — kinematic lock puts them to sleep
+                    body->activate(true);
+
+                    float mass = body->getMass();
+                    // Heavier bodies (breast/hip in PMX) get proportionally
+                    // stronger impulse to overcome their animation constraint
+                    float scale = (mass >= JIGGLE_MASS_THRESHOLD)
+                                  ? (1.0f + mass * 0.5f)
+                                  : 1.0f;
+
+                    body->applyCentralImpulse(btVector3(
+                        m_jiggleImpulseX * scale,
+                        -m_jiggleImpulseY * scale,
+                        0.f
+                    ));
+                }
+            }
+        }
+    }
+
     model->UpdatePhysicsAnimation(physDt);
     model->UpdateNodeAnimation(true);
 

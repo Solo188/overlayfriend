@@ -105,11 +105,6 @@ private:
     float m_jiggleImpulseX = 0.f, m_jiggleImpulseY = 0.f;
     bool  m_jiggleFired = false;
 
-    // Smoothed Y-axis gravity offset for vertical inertia (drag up/down).
-    // Added to the base -9.8 gravity so soft bodies feel the correct
-    // inertial force when the overlay window accelerates vertically.
-    float m_gravYOffset = 0.f;
-
     // Blink state
     float m_blinkTimer    = 0.f;
     float m_blinkInterval = 3.5f;
