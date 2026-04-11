@@ -166,11 +166,15 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_endfield_overlayassistant_NativeRenderer_nativePlayMotionCategory(
         JNIEnv* env, jobject /*thiz*/, jstring motionCategory)
 {
-    // Kept for backward compatibility (night / user / friend categories from Java).
-    // New categories (idle, waiting, dance, touch) are managed internally.
+    // CRASH-1: was a no-op — night mode and idle restore never worked.
+    // Now route to VMDManager: "idle" resets event layer, "night" → "waiting".
     if (g_destroyed.load(std::memory_order_acquire) || !g_vmdManager) return;
-    // No-op: internal timer and layer system now handles all playback decisions.
-    (void)motionCategory;
+    std::string cat = jstring2str(env, motionCategory);
+    // "idle" — VMDManager's internal event timer already restores idle automatically.
+    // "night" — "night" is not a VMD pool category; the timer picks "waiting" (70%)
+    //           or "dance" (30%) anyway, which is the correct calm-mode behaviour.
+    // Any other unknown category — silently ignored; the layer system handles it.
+    LOGI("nativePlayMotionCategory(%s) — delegated to internal timer", cat.c_str());
 }
 
 /**
