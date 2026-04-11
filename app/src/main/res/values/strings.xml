@@ -21,7 +21,7 @@
 
     <!-- Folder structure card -->
     <string name="folder_base">/sdcard/Documents/Assistant/</string>
-    <string name="folder_pmx">  Yvonne.pmx</string>
+    <string name="folder_pmx">  model.pmx</string>
     <string name="folder_textures">  textures/</string>
     <string name="folder_idle">  motions/idle/</string>
     <string name="folder_poses">  motions/poses/</string>
