@@ -70,18 +70,45 @@ static constexpr float PHYS_DT_EMA = 0.12f;
 static constexpr float WEIGHT_FADE_SPEED = 2.5f;
 
 // ── Physics inertia constants ─────────────────────────────────────────────────
+//
+// DRAG_INERTIA_SCALE   — screen-velocity → gravity-tilt multiplier.
+// MAX_LATERAL_GRAVITY  — X-axis tilt cap (left/right hair/cloth sway).
+// MAX_VERTICAL_INERTIA — Y-axis offset cap; smaller than X because large
+//                        offsets to -9.8 base gravity make bodies visibly float.
+// INERTIA_DECAY        — EMA snap-back speed (higher = snappier return).
+//
+static constexpr float DRAG_INERTIA_SCALE    = 18.f / 2000.f;
+static constexpr float MAX_LATERAL_GRAVITY   = 18.f;
+static constexpr float MAX_VERTICAL_INERTIA  = 8.f;
+static constexpr float INERTIA_DECAY         = 0.82f;
 
-static constexpr float DRAG_INERTIA_SCALE  = 18.f / 2000.f;
-static constexpr float MAX_LATERAL_GRAVITY = 20.f;
-static constexpr float INERTIA_DECAY       = 0.80f;
-
-// ── Jiggle impulse constants ──────────────────────────────────────────────────
-
-static constexpr float JIGGLE_TRIGGER_DELTA  = 50.f;
+// ── High-Damping Mass-Spring jiggle constants ─────────────────────────────────
+//
+// JIGGLE_TRIGGER_DELTA  — min velocity-change (px/s) to fire an impulse.
+//                         60 = reacts to subtle moves; damping prevents wildness.
+// JIGGLE_MASS_THRESHOLD — only bodies >= this mass receive impulses.
+//                         Keeps light hair joints stable; breast/hip bodies react.
+// JIGGLE_IMPULSE_SCALE  — raw impulse scale before mass multiplication.
+//                         Reduced vs old value; mass influence compensates.
+// JIGGLE_MAX_IMPULSE    — per-body hard cap; prevents Bullet explosions on
+//                         fast swipes (Poco X3 Pro high-frequency touch events).
+// JIGGLE_IMPULSE_DECAY  — frame-over-frame impulse persistence (0.88 ≈ 8 frames
+//                         to 1/e at 60fps) — the "spring-out / memory" effect.
+// LINEAR_DAMPING        — applied directly to each qualifying rigid body.
+//                         0.95 simulates soft tissue resistance; body moves but
+//                         damps quickly instead of bouncing forever (no "jelly").
+// ANGULAR_DAMPING       — same principle for rotation.
+// MAX_VELOCITY_OFFSET   — caps the velocity correction in applyPhysicsInertia
+//                         to prevent the "tearing from body" artefact.
+//
+static constexpr float JIGGLE_TRIGGER_DELTA  = 60.f;
 static constexpr float JIGGLE_MASS_THRESHOLD = 0.3f;
-static constexpr float JIGGLE_IMPULSE_SCALE  = 0.035f;
-static constexpr float JIGGLE_MAX_IMPULSE    = 8.0f;
-static constexpr float JIGGLE_IMPULSE_DECAY  = 0.85f;
+static constexpr float JIGGLE_IMPULSE_SCALE  = 0.012f;
+static constexpr float JIGGLE_MAX_IMPULSE    = 5.0f;
+static constexpr float JIGGLE_IMPULSE_DECAY  = 0.88f;
+static constexpr float LINEAR_DAMPING        = 0.95f;
+static constexpr float ANGULAR_DAMPING       = 0.95f;
+static constexpr float MAX_VELOCITY_OFFSET   = 4.0f;
 
 // ── Constructor / Destructor ──────────────────────────────────────────────────
 
@@ -273,8 +300,30 @@ void VMDManager::tickEventTimer(float dt) {
     LOGI("Next event timer: %.0f s", m_nextEventTimer);
 }
 
-// ── Physics inertia (gravity tilt → hair / cloth) ─────────────────────────────
-
+// ── Physics inertia (gravity tilt + velocity offset → hair / cloth) ──────────
+//
+// Two-part inertia system:
+//
+//   Part 1 — Gravity tilt (unchanged from before):
+//     Horizontal drag tilts gravity on X → hair/cloth sways left/right.
+//
+//   Part 2 — Vertical velocity offset (NEW, replaces raw Y force):
+//     Instead of adding a raw force on Y every frame (which causes the
+//     "tearing from body" artefact when the window is dragged fast), we
+//     compute a Target Velocity Offset and lerp each body's current velocity
+//     toward it.  This is a soft constraint — bodies move toward the target
+//     but are never teleported, so the mesh cannot stretch beyond realistic
+//     limits.  MAX_VELOCITY_OFFSET clamps the correction so even extreme
+//     drag speeds don't cause visible pop.
+//
+//   Screen-Y inversion note:
+//     Screen Y grows downward; Bullet World Y grows upward.
+//     When window falls  (dragVelY > 0): bodies should feel upward inertia
+//     → target velocity offset = +value on Bullet Y.
+//     When window rises  (dragVelY < 0): bodies feel downward inertia
+//     → target velocity offset = -value on Bullet Y.
+//     Formula: targetVelY = -dragVelY * scale  (negate to invert screen→world)
+//
 void VMDManager::applyPhysicsInertia(void* modelRaw, float /*dt*/) {
     saba::MMDModel* model = static_cast<saba::MMDModel*>(modelRaw);
     if (!model) return;
@@ -283,31 +332,74 @@ void VMDManager::applyPhysicsInertia(void* modelRaw, float /*dt*/) {
     btDiscreteDynamicsWorld* world = mmPhysics->GetDynamicsWorld();
     if (!world) return;
 
-    // X-axis tilt: horizontal screen drag → lateral gravity
+    // ── Part 1: X gravity tilt (horizontal drag → lateral sway) ──────────
     float targetGx = std::max(-MAX_LATERAL_GRAVITY,
                      std::min( MAX_LATERAL_GRAVITY, -m_dragVelX * DRAG_INERTIA_SCALE));
-    // Y-axis inertia: vertical screen drag → up/down gravity offset (jump/fall effect)
-    // Previously mapped to Z (into screen) — wrong for Y-up MMD coordinate system.
-    float targetGy = std::max(-MAX_LATERAL_GRAVITY,
-                     std::min( MAX_LATERAL_GRAVITY, -m_dragVelY * DRAG_INERTIA_SCALE));
 
     btVector3 curG = world->getGravity();
     float newGx = curG.x() + (targetGx - curG.x()) * (1.f - INERTIA_DECAY);
-    float newGy = curG.y() + ((-9.8f + targetGy) - curG.y()) * (1.f - INERTIA_DECAY);
 
-    if (std::abs(m_dragVelX) < 5.f && std::abs(m_dragVelY) < 5.f) {
-        newGx *= INERTIA_DECAY;
-        newGy  = curG.y() + (-9.8f - curG.y()) * (1.f - INERTIA_DECAY);
+    bool nearStill = (std::abs(m_dragVelX) < 5.f && std::abs(m_dragVelY) < 5.f);
+    if (nearStill) newGx *= INERTIA_DECAY;
+
+    // Keep Y at base -9.8; Z stays 0.  Vertical inertia is handled below.
+    world->setGravity(btVector3(newGx, -9.8f, 0.f));
+
+    // ── Part 2: Y velocity offset (vertical drag → up/down inertia) ──────
+    // Compute target Y velocity: invert screen-Y so falling window = upward felt force.
+    float rawTargetVy = -m_dragVelY * DRAG_INERTIA_SCALE * 300.f; // scale px/s → m/s range
+    float targetVy    = std::max(-MAX_VELOCITY_OFFSET,
+                        std::min( MAX_VELOCITY_OFFSET, rawTargetVy));
+
+    if (nearStill) targetVy = 0.f;
+
+    const btCollisionObjectArray& objs = world->getCollisionObjectArray();
+    for (int i = 0; i < objs.size(); ++i) {
+        btRigidBody* rb = btRigidBody::upcast(objs[i]);
+        if (!rb || rb->isStaticObject() || rb->isKinematicObject()) continue;
+        if (rb->getMass() < JIGGLE_MASS_THRESHOLD) continue;
+
+        // Wake the body — Bullet deactivates idle bodies to save CPU.
+        // Without this, subtle velocity changes are silently ignored.
+        rb->activate(true);
+
+        // Lerp current Y velocity toward the target offset.
+        // We only touch Y; X and Z are left to Bullet.
+        btVector3 vel = rb->getLinearVelocity();
+        float newVy   = vel.y() + (targetVy - vel.y()) * (1.f - INERTIA_DECAY);
+
+        // Displacement clamp: prevent stretching beyond realistic limits.
+        // If the corrected velocity would move the body more than MAX_VELOCITY_OFFSET
+        // m/s, clamp it back.  This is the soft constraint that replaces raw force.
+        newVy = std::max(-MAX_VELOCITY_OFFSET, std::min(MAX_VELOCITY_OFFSET, newVy));
+
+        rb->setLinearVelocity(btVector3(vel.x(), newVy, vel.z()));
     }
-
-    world->setGravity(btVector3(newGx, newGy, 0.f));
 }
 
-// ── Jiggle impulse (heavy rigid bodies = breast / hip) ────────────────────────
-
+// ── Jiggle impulse — High-Damping Mass-Spring system ─────────────────────────
+//
+// Overview:
+//   1. Detect a sudden velocity change (jerk) exceeding JIGGLE_TRIGGER_DELTA.
+//   2. Compute an impulse proportional to the jerk, scaled by body mass
+//      (heavier bodies = larger impulse so they overcome animation constraints).
+//   3. Apply LINEAR_DAMPING / ANGULAR_DAMPING to each qualifying body ONCE on
+//      first trigger — this makes them behave like soft tissue instead of
+//      bouncing elastic balls ("jelly" prevention).
+//   4. Wake every qualifying body with activate(true) EVERY time m_jiggleFired
+//      is true — Bullet's sleep system silently ignores forces on sleeping bodies,
+//      which was the cause of "subtle jiggles are invisible" complaints.
+//   5. Decay the accumulated impulse at JIGGLE_IMPULSE_DECAY per frame for
+//      smooth spring-out rather than abrupt cutoff.
+//
+// Axis mapping (screen → Bullet):
+//   deltaVx (finger left/right) → Bullet X impulse  (negate: move right → push left)
+//   deltaVy (finger up/down)    → Bullet Y impulse  (negate: move down → push up)
+//   Z is always 0 — no depth component from 2D drag.
+//
 void VMDManager::applyJiggleImpulses(void* modelRaw) {
-    float deltaVx = m_dragVelX - m_prevDragVelX;
-    float deltaVy = m_dragVelY - m_prevDragVelY;
+    float deltaVx  = m_dragVelX - m_prevDragVelX;
+    float deltaVy  = m_dragVelY - m_prevDragVelY;
     float deltaMag = std::sqrt(deltaVx * deltaVx + deltaVy * deltaVy);
 
     m_prevDragVelX = m_dragVelX;
@@ -316,7 +408,8 @@ void VMDManager::applyJiggleImpulses(void* modelRaw) {
     bool trigger = (deltaMag >= JIGGLE_TRIGGER_DELTA) && !m_jiggleFired;
     if (trigger) {
         m_jiggleImpulseX = -deltaVx * JIGGLE_IMPULSE_SCALE;
-        m_jiggleImpulseY = -deltaVy * JIGGLE_IMPULSE_SCALE;
+        m_jiggleImpulseY = -deltaVy * JIGGLE_IMPULSE_SCALE;   // screen-Y inverted → world-Y
+
         float mag = std::sqrt(m_jiggleImpulseX * m_jiggleImpulseX +
                               m_jiggleImpulseY * m_jiggleImpulseY);
         if (mag > JIGGLE_MAX_IMPULSE) {
@@ -325,7 +418,7 @@ void VMDManager::applyJiggleImpulses(void* modelRaw) {
             m_jiggleImpulseY *= s;
         }
         m_jiggleFired = true;
-        LOGI("Jiggle: (%.3f, %.3f) dV=%.1f", m_jiggleImpulseX, m_jiggleImpulseY, deltaMag);
+        LOGI("Jiggle fired: IX=%.3f IY=%.3f dV=%.1f", m_jiggleImpulseX, m_jiggleImpulseY, deltaMag);
     } else if (deltaMag < JIGGLE_TRIGGER_DELTA * 0.5f) {
         m_jiggleFired = false;
     }
@@ -347,18 +440,42 @@ void VMDManager::applyJiggleImpulses(void* modelRaw) {
         float mass = rb->getMass();
         if (mass < JIGGLE_MASS_THRESHOLD) continue;
 
-        float scaledIx = m_jiggleImpulseX * mass;
-        float scaledIy = m_jiggleImpulseY * mass;
-        float bodyMag  = std::sqrt(scaledIx * scaledIx + scaledIy * scaledIy);
-        if (bodyMag > JIGGLE_MAX_IMPULSE * mass) {
-            float s = JIGGLE_MAX_IMPULSE * mass / bodyMag;
+        // ── Step 1: Apply High-Damping on first trigger ───────────────────
+        // setDamping persists across frames — we only need to set it once
+        // per jiggle event, not every frame.  This converts the body from
+        // an elastic spring into a soft-tissue mass.
+        if (m_jiggleFired) {
+            rb->setDamping(LINEAR_DAMPING, ANGULAR_DAMPING);
+        }
+
+        // ── Step 2: Wake the body unconditionally ─────────────────────────
+        // Bullet puts dynamic bodies to sleep after ~2 s of low movement.
+        // A sleeping body ignores ALL forces and impulses silently.
+        // activate(true) forces it awake so even subtle jiggles are felt.
+        rb->activate(true);
+
+        // ── Step 3: Mass-scaled impulse ───────────────────────────────────
+        // Heavier bodies (breast, hip in PMX) need a proportionally larger
+        // impulse to overcome their animation pose offset and move visibly.
+        // Light bodies (hair ribbons, small accessories) get the base impulse.
+        float massInfluence = 1.0f + mass * 0.8f;   // heavier → stronger reaction
+        float scaledIx = m_jiggleImpulseX * massInfluence;
+        float scaledIy = m_jiggleImpulseY * massInfluence;
+
+        // Per-body hard cap — prevents any single body from exploding
+        float bodyMag = std::sqrt(scaledIx * scaledIx + scaledIy * scaledIy);
+        if (bodyMag > JIGGLE_MAX_IMPULSE) {
+            float s = JIGGLE_MAX_IMPULSE / bodyMag;
             scaledIx *= s;
             scaledIy *= s;
         }
-        rb->applyCentralImpulse(btVector3(scaledIx, scaledIy, 0.f)); // FIX: Y→Y not Y→Z
-        rb->activate(true);
+
+        // Apply: X=left/right, Y=up/down (screen-Y already negated above), Z=0
+        rb->applyCentralImpulse(btVector3(scaledIx, scaledIy, 0.f));
     }
 
+    // ── Step 4: Decay impulse for spring-out effect ───────────────────────
+    // 0.88^60 ≈ 0.0006 → impulse reaches noise floor in ~1 second at 60fps.
     m_jiggleImpulseX *= JIGGLE_IMPULSE_DECAY;
     m_jiggleImpulseY *= JIGGLE_IMPULSE_DECAY;
 }
@@ -435,47 +552,9 @@ void VMDManager::update(float rawDeltaTime) {
         m_event.anim->Evaluate(m_event.time * 30.f, m_event.weight);
     }
 
-    // Run morph, IK (pre-physics)
+    // Run morph, IK (pre-physics), physics, IK (post-physics)
     model->UpdateMorphAnimation();
     model->UpdateNodeAnimation(false);
-
-    // ── Pre-physics jiggle override ───────────────────────────────────────
-    // Apply central impulse to ALL dynamic rigid bodies right before the
-    // physics step — this forces breast/hair bodies out of their
-    // animation-locked or sleeping state so Bullet can simulate them freely.
-    {
-        auto* mmPhysics = model->GetMMDPhysics();
-        if (mmPhysics) {
-            btDiscreteDynamicsWorld* world = mmPhysics->GetDynamicsWorld();
-            if (world &&
-                (std::abs(m_jiggleImpulseX) > 0.0001f ||
-                 std::abs(m_jiggleImpulseY) > 0.0001f))
-            {
-                const btCollisionObjectArray& objs = world->getCollisionObjectArray();
-                for (int i = 0; i < objs.size(); ++i) {
-                    btRigidBody* body = btRigidBody::upcast(objs[i]);
-                    if (!body || body->isStaticObject() || body->isKinematicObject()) continue;
-
-                    // Wake the body — kinematic lock puts them to sleep
-                    body->activate(true);
-
-                    float mass = body->getMass();
-                    // Heavier bodies (breast/hip in PMX) get proportionally
-                    // stronger impulse to overcome their animation constraint
-                    float scale = (mass >= JIGGLE_MASS_THRESHOLD)
-                                  ? (1.0f + mass * 0.5f)
-                                  : 1.0f;
-
-                    body->applyCentralImpulse(btVector3(
-                        m_jiggleImpulseX * scale,
-                        -m_jiggleImpulseY * scale,
-                        0.f
-                    ));
-                }
-            }
-        }
-    }
-
     model->UpdatePhysicsAnimation(physDt);
     model->UpdateNodeAnimation(true);
 
