@@ -82,6 +82,9 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        // CRASH-5: read actual service state — m_serviceRunning resets on Activity recreation.
+        m_serviceRunning = OverlayService.sRunning;
+        m_btnStartStop.setText(m_serviceRunning ? R.string.btn_stop : R.string.btn_start);
         refreshPermissionSwitches();
         checkModelFile();
         updateAffinityDisplay();

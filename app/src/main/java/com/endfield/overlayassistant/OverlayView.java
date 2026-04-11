@@ -272,6 +272,10 @@ public class OverlayView extends FrameLayout {
     // ─────────────────────────────────────────────────────────────────────
 
     private int[] getScreenBounds() {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            android.graphics.Rect bounds = m_wm.getCurrentWindowMetrics().getBounds();
+            return new int[]{ 0, 0, bounds.width(), bounds.height() };
+        }
         DisplayMetrics dm = new DisplayMetrics();
         if (m_wm != null) m_wm.getDefaultDisplay().getRealMetrics(dm);
         return new int[]{ 0, 0, dm.widthPixels, dm.heightPixels };
@@ -432,6 +436,13 @@ public class OverlayView extends FrameLayout {
      *   2. Queue nativeDestroy() and block on a CountDownLatch until it finishes.
      *   3. Only then call onPause(), which destroys the EGL surface safely.
      */
+
+    /** BUG-3: Switch render mode to save battery at night. */
+    public void setPowerSave(boolean enabled) {
+        if (enabled) m_glView.setRenderMode(GLSurfaceView.RENDERMODE_WHEN_DIRTY);
+        else         m_glView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
+    }
+
     @Override
     protected void onDetachedFromWindow() {
         m_glReady = false;
@@ -442,16 +453,19 @@ public class OverlayView extends FrameLayout {
             latch.countDown();
         });
 
-        try {
-            // 2-second safety timeout prevents ANR if the GL thread is hung.
-            if (!latch.await(2, TimeUnit.SECONDS)) {
-                Log.w(TAG, "nativeDestroy did not complete within 2 s — proceeding anyway");
+        // CRASH-4: await on a background thread — blocking main thread for 2 s risks ANR.
+        // onPause() is called from the background thread once nativeDestroy completes.
+        new Thread(() -> {
+            try {
+                if (!latch.await(2, TimeUnit.SECONDS)) {
+                    Log.w(TAG, "nativeDestroy did not complete within 2 s — proceeding anyway");
+                }
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
             }
-        } catch (InterruptedException ignored) {
-            Thread.currentThread().interrupt();
-        }
+            m_glView.onPause();
+        }, "gl-destroy").start();
 
-        m_glView.onPause();
         super.onDetachedFromWindow();
     }
 }
