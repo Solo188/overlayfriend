@@ -129,7 +129,7 @@ void main() {
     }
     // No texture: use diffuse.a as-is (shadow mats alpha=0.3 by design).
 
-    if (alpha * u_globalAlpha < 0.01) discard;
+    if (alpha * u_globalAlpha < 0.2) discard;
 
     vec3  N     = normalize(v_normal);
     float NdotL = max(dot(N, LIGHT_DIR), 0.0);
@@ -613,10 +613,10 @@ void MMDRenderer::render(float dt) {
     // FOV=30 removes face distortion (telephoto-like, no wide-angle stretch).
     // Camera at y=10, z=40; target at y=12 (head level) to frame the model
     // naturally — head centered, full body visible.
-    glm::mat4 proj = glm::perspective(glm::radians(30.f), aspect, 0.1f, 500.f);
-    glm::mat4 view = glm::lookAt(glm::vec3(0.f, 10.f, 40.f),
-                                 glm::vec3(0.f, 12.f,  0.f),
-                                 glm::vec3(0.f,  1.f,  0.f));
+    glm::mat4 proj = glm::perspective(glm::radians(30.0f), aspect, 0.1f, 2000.0f);
+    glm::mat4 view = glm::lookAt(glm::vec3(0.0f, 12.5f, 45.0f),
+                                 glm::vec3(0.0f, 12.5f,  0.0f),
+                                 glm::vec3(0.0f,  1.0f,  0.0f));
 
     // Rotation matrix: model rotates around its own centre
     glm::mat4 model = glm::mat4(1.f);
@@ -707,6 +707,13 @@ void MMDRenderer::drawModel() {
         if (pass == 0 &&  isTransparent) continue;
         if (pass == 1 && !isTransparent) continue;
 
+        // Z-fighting fix for face details (eyes, eyebrows, mouth overlay on skin).
+        // Pull transparent layers slightly toward camera so they don't sink into skin.
+        if (pass == 1) {
+            glEnable(GL_POLYGON_OFFSET_FILL);
+            glPolygonOffset(-1.0f, -1.0f);
+        }
+
         // bothFace = double-sided, disable culling; otherwise GL_BACK culling
         if (mat.m_bothFace) glDisable(GL_CULL_FACE);
         else { glEnable(GL_CULL_FACE); glCullFace(GL_BACK); }
@@ -740,6 +747,8 @@ void MMDRenderer::drawModel() {
                        (GLsizei)sm.m_vertexCount,
                        GL_UNSIGNED_INT,
                        (void*)((uintptr_t)sm.m_beginIndex * sizeof(uint32_t)));
+
+        if (pass == 1) glDisable(GL_POLYGON_OFFSET_FILL);
     } // end submesh loop
 
     } // end pass loop
