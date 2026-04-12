@@ -613,9 +613,9 @@ void MMDRenderer::render(float dt) {
     // FOV=30 removes face distortion (telephoto-like, no wide-angle stretch).
     // Camera at y=10, z=40; target at y=12 (head level) to frame the model
     // naturally — head centered, full body visible.
-    glm::mat4 proj = glm::perspective(glm::radians(30.0f), aspect, 0.1f, 2000.0f);
-    glm::mat4 view = glm::lookAt(glm::vec3(0.0f, 12.5f, 45.0f),
-                                 glm::vec3(0.0f, 12.5f,  0.0f),
+    glm::mat4 proj = glm::perspective(glm::radians(30.0f), aspect, 1.0f, 2000.0f);
+    glm::mat4 view = glm::lookAt(glm::vec3(0.0f, 13.0f, 45.0f),
+                                 glm::vec3(0.0f, 13.0f,  0.0f),
                                  glm::vec3(0.0f,  1.0f,  0.0f));
 
     // Rotation matrix: model rotates around its own centre
@@ -707,13 +707,6 @@ void MMDRenderer::drawModel() {
         if (pass == 0 &&  isTransparent) continue;
         if (pass == 1 && !isTransparent) continue;
 
-        // Z-fighting fix for face details (eyes, eyebrows, mouth overlay on skin).
-        // Pull transparent layers slightly toward camera so they don't sink into skin.
-        if (pass == 1) {
-            glEnable(GL_POLYGON_OFFSET_FILL);
-            glPolygonOffset(-1.0f, -1.0f);
-        }
-
         // bothFace = double-sided, disable culling; otherwise GL_BACK culling
         if (mat.m_bothFace) glDisable(GL_CULL_FACE);
         else { glEnable(GL_CULL_FACE); glCullFace(GL_BACK); }
@@ -743,12 +736,22 @@ void MMDRenderer::drawModel() {
         m_toonShader->setUniform1i("u_spTex",  1);
         m_toonShader->setUniform1i("u_spMode", spId ? spMode : 0);
 
+        bool isFaceDetail = (pass == 1 && sm.m_vertexCount < 2000);
+        if (isFaceDetail) {
+            glEnable(GL_POLYGON_OFFSET_FILL);
+            glPolygonOffset(-1.0f, -1.0f);
+            glDepthMask(GL_TRUE);
+        }
+
         glDrawElements(GL_TRIANGLES,
                        (GLsizei)sm.m_vertexCount,
                        GL_UNSIGNED_INT,
                        (void*)((uintptr_t)sm.m_beginIndex * sizeof(uint32_t)));
 
-        if (pass == 1) glDisable(GL_POLYGON_OFFSET_FILL);
+        if (isFaceDetail) {
+            glDisable(GL_POLYGON_OFFSET_FILL);
+            glDepthMask(GL_FALSE);
+        }
     } // end submesh loop
 
     } // end pass loop
