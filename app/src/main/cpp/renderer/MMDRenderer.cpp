@@ -739,7 +739,7 @@ void MMDRenderer::drawOutline(const glm::mat4& /*mvp*/) {
     for (size_t i = 0; i < smCount; ++i) {
         const saba::MMDSubMesh&  sm  = sms[i];
         const saba::MMDMaterial& mat = mats[sm.m_materialID];
-        if (!mat.m_edgeFlag || mat.m_edgeSize <= 0.0f) continue;
+        if (mat.m_bothFace || !mat.m_edgeFlag || mat.m_edgeSize <= 0.0f) continue;
         glDrawElements(GL_TRIANGLES,
                        (GLsizei)sm.m_vertexCount,
                        GL_UNSIGNED_INT,
