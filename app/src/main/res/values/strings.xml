@@ -28,7 +28,7 @@
     <string name="folder_waiting">  motions/waiting/</string>
     <string name="folder_dance">  motions/dance/</string>
     <string name="folder_touch">  motions/touch/</string>
-    <string name="folder_hint">● idle — looping breath/stand animations\n● poses — static base poses\n● waiting — random reactions (70%)\n● dance — random dance events (30%)\n● touch — tap reactions\n\nFolders are created automatically on first launch.</string>
+    <string name="folder_hint" formatted="false">● idle — looping breath/stand animations\n● poses — static base poses\n● waiting — random reactions (70%)\n● dance — random dance events (30%)\n● touch — tap reactions\n\nFolders are created automatically on first launch.</string>
 
     <!-- Folder status labels -->
     <string name="status_ok">✓ OK</string>
