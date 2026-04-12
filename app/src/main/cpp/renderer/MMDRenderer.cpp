@@ -41,6 +41,7 @@
 #include <stb_image.h>
 
 #include <algorithm>
+#include <vector>
 #include <cmath>
 
 #define LOG_TAG "MMDRenderer"
@@ -119,6 +120,10 @@ void main() {
 
     if (u_hasTexture == 1) {
         vec4 texColor = texture(u_texDiffuse, v_uv);
+        // Alpha test: discard fully transparent texture pixels immediately.
+        // This prevents invisible polygons from writing to the depth buffer
+        // and blocking geometry behind them (causes grey rect artifacts on clothes).
+        if (texColor.a < 0.1) discard;
         albedo = texColor.rgb;
         alpha  = texColor.a * u_diffuse.a;
     }
@@ -226,6 +231,8 @@ bool MMDRenderer::initialize(int width, int height) {
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    // Smooth hair/cloth edges — blends alpha into MSAA coverage mask
+    glEnable(GL_SAMPLE_ALPHA_TO_COVERAGE);
     glClearColor(0.f, 0.f, 0.f, 0.f);
 
     LOGI("initialize OK (%dx%d)", width, height);
@@ -588,7 +595,7 @@ void MMDRenderer::render(float dt) {
     float aspect = (m_height > 0)
                    ? static_cast<float>(m_width) / static_cast<float>(m_height)
                    : 1.f;
-    glm::mat4 proj = glm::perspective(glm::radians(45.f), aspect, 0.1f, 500.f);
+    glm::mat4 proj = glm::perspective(glm::radians(30.f), aspect, 0.1f, 500.f);
     glm::mat4 view = glm::lookAt(glm::vec3(0.f, 10.f, 40.f),
                                  glm::vec3(0.f, 10.f,  0.f),
                                  glm::vec3(0.f,  1.f,  0.f));
@@ -643,15 +650,28 @@ void MMDRenderer::drawModel() {
     size_t smCount = m_model->GetSubMeshCount();
 
     // ── Two-pass render: opaque first, transparent second ─────────────────
-    // Without this, a transparent material (e.g. eye shadow, hair shadow,
-    // alpha=0.3) drawn early in PMX order writes to the depth buffer and
-    // blocks the opaque geometry behind it — causing "missing" face/hair layers.
-    // Pass 0: opaque only  (mat.m_alpha >= 1.0) — writes depth normally
-    // Pass 1: transparent  (mat.m_alpha <  1.0) — depth test ON, depth write OFF
+    // Pass 0: opaque   (mat.m_alpha >= 1.0) — depth write ON
+    // Pass 1: transparent (mat.m_alpha < 1.0) — depth write OFF, sorted back-to-front
+
+    // Build sorted index list for transparent pass (back-to-front by submesh index).
+    // Full camera-space sort is expensive; PMX order is already roughly correct
+    // (artist-defined), so we just reverse it for transparent materials.
+    std::vector<size_t> transparentOrder;
+    for (size_t i = 0; i < smCount; ++i) {
+        if (mats[sms[i].m_materialID].m_alpha < 0.999f)
+            transparentOrder.push_back(i);
+    }
+    // Reverse: draw far-first (last submesh = innermost = draw first)
+    std::reverse(transparentOrder.begin(), transparentOrder.end());
+
     for (int pass = 0; pass < 2; ++pass) {
     if (pass == 1) glDepthMask(GL_FALSE);  // transparent pass: no depth write
 
-    for (size_t i = 0; i < smCount; ++i) {
+    // For transparent pass use sorted order; opaque pass uses natural PMX order
+    size_t loopCount = (pass == 1) ? transparentOrder.size() : smCount;
+
+    for (size_t li = 0; li < loopCount; ++li) {
+        size_t i = (pass == 1) ? transparentOrder[li] : li;
         const saba::MMDSubMesh&  sm  = sms[i];
         const saba::MMDMaterial& mat = mats[sm.m_materialID];
 
@@ -691,7 +711,7 @@ void MMDRenderer::drawModel() {
                        (GLsizei)sm.m_vertexCount,
                        GL_UNSIGNED_INT,
                        (void*)((uintptr_t)sm.m_beginIndex * sizeof(uint32_t)));
-    } // end submesh loop
+    } // end submesh/transparent loop
 
     if (pass == 1) glDepthMask(GL_TRUE); // restore depth write
     } // end pass loop
