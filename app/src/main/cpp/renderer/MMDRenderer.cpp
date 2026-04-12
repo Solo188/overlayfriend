@@ -106,15 +106,16 @@ uniform float     u_globalAlpha;
 uniform sampler2D u_spTex;
 uniform int       u_spMode;
 
-// Key light: front-facing and slightly from upper-right, warm tone
-const vec3 LIGHT_DIR  = normalize(vec3(0.4, 1.0, 1.5));
+// ── Lighting constants ────────────────────────────────────────────────────
+// Key light from upper-front-right, slightly warm
+const vec3 LIGHT_DIR  = normalize(vec3(0.3, 1.0, 1.2));
 const vec3 LIGHT_COL  = vec3(1.0, 0.97, 0.93);
-// Fill light from opposite side — prevents pitch-black shadows
-const vec3 RIM_DIR    = normalize(vec3(-0.6, 0.3, -1.0));
-const vec3 RIM_COL    = vec3(0.18, 0.20, 0.28);
+// Soft fill from opposite side to prevent fully black shadows
+const vec3 FILL_DIR   = normalize(vec3(-0.5, 0.2, -0.8));
+const vec3 FILL_COL   = vec3(0.10, 0.11, 0.15);
 const vec3 CAMERA_POS = vec3(0.0, 10.0, 40.0);
-// Brighter ambient — shadow areas stay readable, not black
-const vec3 SCENE_AMB  = vec3(0.30, 0.27, 0.25);
+// Low scene ambient — keeps shadows dark so face has contrast
+const vec3 SCENE_AMB  = vec3(0.06, 0.06, 0.07);
 
 void main() {
     vec3  albedo = u_diffuse.rgb;
@@ -125,59 +126,49 @@ void main() {
         albedo = texColor.rgb;
         alpha  = texColor.a * u_diffuse.a;
     }
-    // No texture: diffuse.a is used as-is. Do not force to 1.0 -- shadow
-    // materials (eye shadow, hair shadow) have alpha=0.3 in PMX by design.
+    // No texture: use diffuse.a as-is (shadow mats have alpha=0.3 by design).
 
     if (alpha * u_globalAlpha < 0.01) discard;
 
-    vec3  N     = normalize(v_normal);
+    vec3 N      = normalize(v_normal);
     float NdotL = max(dot(N, LIGHT_DIR), 0.0);
+    float NdotF = max(dot(N, FILL_DIR),  0.0);
 
-    // Three-band cel-shading: bright / mid / shadow
-    float toon = NdotL > 0.65 ? 0.90 : NdotL > 0.25 ? 0.62 : 0.38;
+    // ── Anime cel-shading (two sharp bands) ──────────────────────────────
+    // Bright band  (NdotL > 0.5):  lit side  — full color
+    // Shadow band  (NdotL <= 0.5): dark side — strong falloff
+    float toon = NdotL > 0.50 ? 1.0 : NdotL > 0.05 ? 0.40 : 0.05;
+    float fill = NdotF * 0.25;  // soft fill, prevents pitch-black
 
-    // Fill light (rim)
-    float rimDot = max(dot(N, RIM_DIR), 0.0);
-    float rim    = rimDot > 0.5 ? 0.18 : 0.0;
+    // Ambient: use PMX material ambient only as a very small AO hint,
+    // clamped low so it never washes out the toon shading.
+    // u_ambient from PMX is often 0.75 which would make everything grey.
+    vec3 matAmb = min(u_ambient * 0.10, vec3(0.08));
+    vec3 sceneAmb = max(matAmb, SCENE_AMB);
 
-    vec3 ambientLight = max(u_ambient, SCENE_AMB);
-    vec3 litColor = albedo * ambientLight
-                  + albedo * LIGHT_COL * toon
-                  + albedo * RIM_COL   * rim;
+    vec3 litColor = albedo * sceneAmb                       // dark ambient base
+                  + albedo * LIGHT_COL * toon               // cel-shaded key light
+                  + albedo * FILL_COL  * fill;              // soft fill
 
-    // Specular highlight
+    // ── Specular ─────────────────────────────────────────────────────────
     vec3  viewDir = normalize(CAMERA_POS - v_worldPos);
     vec3  halfDir = normalize(LIGHT_DIR + viewDir);
-    float spec    = pow(max(dot(N, halfDir), 0.0), 56.0) * (toon / 0.90);
-    litColor     += u_specular * spec * 0.45;
+    float spec    = pow(max(dot(N, halfDir), 0.0), 64.0);
+    // Only add specular on lit side
+    litColor += u_specular * spec * 0.35 * toon;
 
     // ── Sphere / matcap map ───────────────────────────────────────────────
-    // The view-space normal XY maps to UV on the sphere texture.
-    // This is the standard MMD sphere-map technique and provides most of
-    // the characteristic anime-model sheen that plain Phong lighting lacks.
     if (u_spMode != 0) {
-        vec3  vn    = normalize(v_viewNormal);
-        vec2  spUV  = vn.xy * 0.5 + 0.5;
+        vec3  vn   = normalize(v_viewNormal);
+        vec2  spUV = vn.xy * 0.5 + 0.5;
         vec4  spCol = texture(u_spTex, spUV);
-
-        if (u_spMode == 1) {
-            // Multiply: tints the surface (typical for clothing sheen, hair gloss)
-            litColor *= spCol.rgb;
-        } else {
-            // Add: brightest highlights (eyes, metallic parts)
-            litColor += spCol.rgb * spCol.a;
-        }
+        if (u_spMode == 1) litColor *= spCol.rgb;
+        else               litColor += spCol.rgb * spCol.a;
     }
 
-    // Saturation boost — vivid colors like the reference render
-    float lum  = dot(litColor, vec3(0.299, 0.587, 0.114));
-    litColor   = mix(vec3(lum), litColor, 1.0);
-
-    // Subtle contrast micro-curve: lifts midtones, deepens darks
-    litColor = litColor * (litColor * 0.10 + 0.95);
-
-    // Darken model by 15% to match desired appearance
-    litColor *= 0.75;
+    // ── Saturation boost (+20%) ───────────────────────────────────────────
+    float lum = dot(litColor, vec3(0.299, 0.587, 0.114));
+    litColor  = mix(vec3(lum), litColor, 1.20);
 
     fragColor = vec4(litColor, alpha * u_globalAlpha);
 }
