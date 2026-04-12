@@ -107,15 +107,11 @@ uniform sampler2D u_spTex;
 uniform int       u_spMode;
 
 // ── Lighting constants ────────────────────────────────────────────────────
-// Key light from upper-front-right, slightly warm
-const vec3 LIGHT_DIR  = normalize(vec3(0.3, 1.0, 1.2));
-const vec3 LIGHT_COL  = vec3(1.0, 0.97, 0.93);
-// Soft fill from opposite side to prevent fully black shadows
-const vec3 FILL_DIR   = normalize(vec3(-0.5, 0.2, -0.8));
-const vec3 FILL_COL   = vec3(0.10, 0.11, 0.15);
+// Based on PocketMQO default: high ambient, soft directional, warm specular
+// Light direction: slightly from upper-left (Y low = horizontal-ish light)
+const vec3 LIGHT_DIR  = normalize(vec3(0.3, 0.5, 1.0));
+const vec3 LIGHT_COL  = vec3(1.0, 0.98, 0.95);
 const vec3 CAMERA_POS = vec3(0.0, 10.0, 40.0);
-// Low scene ambient — keeps shadows dark so face has contrast
-const vec3 SCENE_AMB  = vec3(0.06, 0.06, 0.07);
 
 void main() {
     vec3  albedo = u_diffuse.rgb;
@@ -126,49 +122,38 @@ void main() {
         albedo = texColor.rgb;
         alpha  = texColor.a * u_diffuse.a;
     }
-    // No texture: use diffuse.a as-is (shadow mats have alpha=0.3 by design).
+    // No texture: use diffuse.a as-is (shadow mats alpha=0.3 by design).
 
     if (alpha * u_globalAlpha < 0.01) discard;
 
-    vec3 N      = normalize(v_normal);
+    vec3  N     = normalize(v_normal);
     float NdotL = max(dot(N, LIGHT_DIR), 0.0);
-    float NdotF = max(dot(N, FILL_DIR),  0.0);
 
-    // ── Anime cel-shading (two sharp bands) ──────────────────────────────
-    // Bright band  (NdotL > 0.5):  lit side  — full color
-    // Shadow band  (NdotL <= 0.5): dark side — strong falloff
-    float toon = NdotL > 0.50 ? 1.0 : NdotL > 0.05 ? 0.40 : 0.05;
-    float fill = NdotF * 0.25;  // soft fill, prevents pitch-black
+    // ── MMD standard lighting (matches PocketMQO default) ─────────────────
+    // ambient:  PMX material ambient (~0.75) as the dark-side floor
+    // diffuse:  smooth Lambertian * 0.6 — soft, no harsh bands
+    // This gives contrast ratio ~1.75x (lit vs shadow) — soft anime look
+    vec3 litColor = albedo * u_ambient                      // ambient base
+                  + albedo * LIGHT_COL * NdotL * 0.6;      // soft directional
 
-    // Ambient: use PMX material ambient only as a very small AO hint,
-    // clamped low so it never washes out the toon shading.
-    // u_ambient from PMX is often 0.75 which would make everything grey.
-    vec3 matAmb = min(u_ambient * 0.10, vec3(0.08));
-    vec3 sceneAmb = max(matAmb, SCENE_AMB);
-
-    vec3 litColor = albedo * sceneAmb                       // dark ambient base
-                  + albedo * LIGHT_COL * toon               // cel-shaded key light
-                  + albedo * FILL_COL  * fill;              // soft fill
-
-    // ── Specular ─────────────────────────────────────────────────────────
+    // ── Specular (Blinn-Phong) ────────────────────────────────────────────
     vec3  viewDir = normalize(CAMERA_POS - v_worldPos);
     vec3  halfDir = normalize(LIGHT_DIR + viewDir);
-    float spec    = pow(max(dot(N, halfDir), 0.0), 64.0);
-    // Only add specular on lit side
-    litColor += u_specular * spec * 0.35 * toon;
+    float spec    = pow(max(dot(N, halfDir), 0.0), 32.0);
+    litColor += u_specular * spec * 0.5;
 
     // ── Sphere / matcap map ───────────────────────────────────────────────
     if (u_spMode != 0) {
-        vec3  vn   = normalize(v_viewNormal);
-        vec2  spUV = vn.xy * 0.5 + 0.5;
+        vec3  vn    = normalize(v_viewNormal);
+        vec2  spUV  = vn.xy * 0.5 + 0.5;
         vec4  spCol = texture(u_spTex, spUV);
         if (u_spMode == 1) litColor *= spCol.rgb;
         else               litColor += spCol.rgb * spCol.a;
     }
 
-    // ── Saturation boost (+20%) ───────────────────────────────────────────
+    // ── Subtle saturation boost (+10%) ────────────────────────────────────
     float lum = dot(litColor, vec3(0.299, 0.587, 0.114));
-    litColor  = mix(vec3(lum), litColor, 1.20);
+    litColor  = mix(vec3(lum), litColor, 1.10);
 
     fragColor = vec4(litColor, alpha * u_globalAlpha);
 }
