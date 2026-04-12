@@ -120,13 +120,13 @@ void main() {
     vec3  albedo = u_diffuse.rgb;
     float alpha  = u_diffuse.a;
 
-    if (u_hasTexture == 0) {
-        alpha = max(alpha, 1.0);
-    } else {
+    if (u_hasTexture == 1) {
         vec4 texColor = texture(u_texDiffuse, v_uv);
         albedo = texColor.rgb;
         alpha  = texColor.a * u_diffuse.a;
     }
+    // No texture: diffuse.a is used as-is. Do not force to 1.0 -- shadow
+    // materials (eye shadow, hair shadow) have alpha=0.3 in PMX by design.
 
     if (alpha * u_globalAlpha < 0.01) discard;
 
@@ -666,9 +666,22 @@ void MMDRenderer::drawModel() {
     const saba::MMDSubMesh*  sms   = m_model->GetSubMeshes();
     size_t smCount = m_model->GetSubMeshCount();
 
+    // ── Two-pass render: opaque first, transparent second ─────────────────
+    // Without this, a transparent material (e.g. eye shadow, hair shadow,
+    // alpha=0.3) drawn early in PMX order writes to the depth buffer and
+    // blocks the opaque geometry behind it — causing "missing" face/hair layers.
+    // Pass 0: opaque only  (mat.m_alpha >= 1.0) — writes depth normally
+    // Pass 1: transparent  (mat.m_alpha <  1.0) — depth test ON, depth write OFF
+    for (int pass = 0; pass < 2; ++pass) {
+    if (pass == 1) glDepthMask(GL_FALSE);  // transparent pass: no depth write
+
     for (size_t i = 0; i < smCount; ++i) {
         const saba::MMDSubMesh&  sm  = sms[i];
         const saba::MMDMaterial& mat = mats[sm.m_materialID];
+
+        bool isTransparent = (mat.m_alpha < 0.999f);
+        if (pass == 0 &&  isTransparent) continue;
+        if (pass == 1 && !isTransparent) continue;
 
         if (mat.m_bothFace) glDisable(GL_CULL_FACE);
         else { glEnable(GL_CULL_FACE); glCullFace(GL_BACK); }
@@ -704,6 +717,10 @@ void MMDRenderer::drawModel() {
                        (void*)((uintptr_t)sm.m_beginIndex * sizeof(uint32_t)));
     }
 
+    } // end inner submesh loop
+    if (pass == 1) glDepthMask(GL_TRUE);  // restore depth write after transparent pass
+    } // end pass loop
+
     // Restore texture units to a clean state
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, 0);
@@ -723,7 +740,7 @@ void MMDRenderer::drawOutline(const glm::mat4& /*mvp*/) {
     for (size_t i = 0; i < smCount; ++i) {
         const saba::MMDSubMesh&  sm  = sms[i];
         const saba::MMDMaterial& mat = mats[sm.m_materialID];
-        if (mat.m_bothFace || mat.m_edgeSize <= 0.0f) continue;
+        if (!mat.m_edgeFlag || mat.m_edgeSize <= 0.0f) continue;
         glDrawElements(GL_TRIANGLES,
                        (GLsizei)sm.m_vertexCount,
                        GL_UNSIGNED_INT,
