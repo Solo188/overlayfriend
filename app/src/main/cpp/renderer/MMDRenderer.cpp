@@ -715,10 +715,9 @@ void MMDRenderer::drawModel() {
                        (GLsizei)sm.m_vertexCount,
                        GL_UNSIGNED_INT,
                        (void*)((uintptr_t)sm.m_beginIndex * sizeof(uint32_t)));
-    }
+    } // end submesh loop
 
-    } // end inner submesh loop
-    if (pass == 1) glDepthMask(GL_TRUE);  // restore depth write after transparent pass
+    if (pass == 1) glDepthMask(GL_TRUE); // restore depth write
     } // end pass loop
 
     // Restore texture units to a clean state
