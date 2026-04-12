@@ -123,7 +123,7 @@ void main() {
         // Alpha test: discard fully transparent texture pixels immediately.
         // This prevents invisible polygons from writing to the depth buffer
         // and blocking geometry behind them (causes grey rect artifacts on clothes).
-        if (texColor.a < 0.1) discard;
+        if (texColor.a < 0.2) discard;
         albedo = texColor.rgb;
         alpha  = texColor.a * u_diffuse.a;
     }
@@ -228,11 +228,26 @@ bool MMDRenderer::initialize(int width, int height) {
     }
 
     glViewport(0, 0, width, height);
+
+    // Depth test — always enabled; write mode toggled per pass in drawModel()
     glEnable(GL_DEPTH_TEST);
-    glEnable(GL_BLEND);
+    glDepthFunc(GL_LEQUAL);
+    glDepthMask(GL_TRUE);
+
+    // Back-face culling — removes inner-mesh artifacts.
+    // Per-material bothFace check in drawModel() overrides this.
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    glFrontFace(GL_CCW);
+
+    // Blending — disabled for opaque pass, enabled for transparent pass.
+    // drawModel() toggles this per-pass.
+    glDisable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    // Smooth hair/cloth edges — blends alpha into MSAA coverage mask
+
+    // Smooth hair/cloth edges via MSAA alpha-to-coverage
     glEnable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+
     glClearColor(0.f, 0.f, 0.f, 0.f);
 
     LOGI("initialize OK (%dx%d)", width, height);
@@ -595,9 +610,12 @@ void MMDRenderer::render(float dt) {
     float aspect = (m_height > 0)
                    ? static_cast<float>(m_width) / static_cast<float>(m_height)
                    : 1.f;
+    // FOV=30 removes face distortion (telephoto-like, no wide-angle stretch).
+    // Camera at y=10, z=40; target at y=12 (head level) to frame the model
+    // naturally — head centered, full body visible.
     glm::mat4 proj = glm::perspective(glm::radians(30.f), aspect, 0.1f, 500.f);
     glm::mat4 view = glm::lookAt(glm::vec3(0.f, 10.f, 40.f),
-                                 glm::vec3(0.f, 10.f,  0.f),
+                                 glm::vec3(0.f, 12.f,  0.f),
                                  glm::vec3(0.f,  1.f,  0.f));
 
     // Rotation matrix: model rotates around its own centre
@@ -665,7 +683,17 @@ void MMDRenderer::drawModel() {
     std::reverse(transparentOrder.begin(), transparentOrder.end());
 
     for (int pass = 0; pass < 2; ++pass) {
-    if (pass == 1) glDepthMask(GL_FALSE);  // transparent pass: no depth write
+
+        // Pass 0 — OPAQUE: depth write ON, blending OFF
+        // Pass 1 — TRANSPARENT: depth write OFF, blending ON, sorted back-to-front
+        if (pass == 0) {
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+        } else {
+            glDepthMask(GL_FALSE);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        }
 
     // For transparent pass use sorted order; opaque pass uses natural PMX order
     size_t loopCount = (pass == 1) ? transparentOrder.size() : smCount;
@@ -679,6 +707,7 @@ void MMDRenderer::drawModel() {
         if (pass == 0 &&  isTransparent) continue;
         if (pass == 1 && !isTransparent) continue;
 
+        // bothFace = double-sided, disable culling; otherwise GL_BACK culling
         if (mat.m_bothFace) glDisable(GL_CULL_FACE);
         else { glEnable(GL_CULL_FACE); glCullFace(GL_BACK); }
 
@@ -711,10 +740,14 @@ void MMDRenderer::drawModel() {
                        (GLsizei)sm.m_vertexCount,
                        GL_UNSIGNED_INT,
                        (void*)((uintptr_t)sm.m_beginIndex * sizeof(uint32_t)));
-    } // end submesh/transparent loop
+    } // end submesh loop
 
-    if (pass == 1) glDepthMask(GL_TRUE); // restore depth write
     } // end pass loop
+
+    // Restore GL state
+    glDepthMask(GL_TRUE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     // Restore texture units to a clean state
     glActiveTexture(GL_TEXTURE1);
